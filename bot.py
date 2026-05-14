@@ -21,13 +21,17 @@ on title words (including CamelCase splits like ``HPA`` from ``HPAReplicasAtMaxC
   LLM_API_KEY         — Bearer token for LiteLLM (Authorization: Bearer …)
 
 Optional AAP MCP (same layout as Cursor ``mcpServers`` HTTP entries — only URL + token in env):
-  AAP_MCP_BASE_URL    — API origin only, e.g. ``https://api.example.com``. The bot builds every toolset
-                        URL as ``{AAP_MCP_BASE_URL}/{toolset}/mcp/`` for all six toolsets (job_management,
-                        inventory_management, system_monitoring, user_management, security_compliance,
-                        platform_configuration). Job/workflow template checks use **job_management** only.
+  AAP_MCP_BASE_URL    — Origin of the **ansible/aap-mcp-server** HTTP service (a separate Route from the AAP
+                        **browser UI**). If you use the controller/gateway SPA host (GET on ``/mcp/…`` returns HTML),
+                        POST will return **405** — point this at the MCP server instead. Toolset URLs are built as
+                        ``{AAP_MCP_BASE_URL}/mcp/{toolset}`` (upstream also supports ``/{toolset}/mcp``). Template
+                        checks use **job_management** only.
   AAP_MCP_TOKEN       — Bearer AAP OAuth2 token for ``Authorization`` (empty only if your gateway injects auth).
+  AAP_MCP_TOOL_JOB_LIST — optional; MCP tool name for job template list (default: ``job_templates_list``).
+  AAP_MCP_TOOL_WFJT_LIST — optional; MCP tool name for workflow job template list (default: ``workflow_job_templates_list``).
   AAP_TLS_VERIFY      — optional; set ``false`` / ``0`` to disable TLS verification **for AAP MCP only** (e.g.
-                        self-signed ingress). If unset, ``TLS_VERIFY`` is checked the same way for AAP only.
+                        self-signed ingress). Uses a dedicated ``httpx`` client with ``verify=False`` (httpx 0.28+
+                        has no per-request ``verify``). If unset, ``TLS_VERIFY`` is checked the same way for AAP only.
                         Default: verify. Unsafe on untrusted networks.
   AAP_MCP_URL         — (legacy) full single MCP URL if you cannot use ``AAP_MCP_BASE_URL`` yet.
 
@@ -36,8 +40,8 @@ Optional:
   HEALTH_PORT         — default 8080; GET /healthz always 200 (liveness); GET /readyz 503 until WS subscribed (readiness)
 
 Retrieval uses itsm-app MCP rag_search_kb. After KB hits, the bot can call AAP MCP
-``controller.job_templates_list`` / ``controller.workflow_job_templates_list`` with a ``search`` query
-for each template name inferred from KB text, then append an **AAP** section to the reply.
+``job_templates_list`` / ``workflow_job_templates_list`` (names from the controller OpenAPI in aap-mcp-server)
+with a ``search`` query for each template name inferred from KB text, then append an **AAP** section to the reply.
 LiteLLM is used only for the KB summary (unchanged).
 """
 
@@ -62,13 +66,28 @@ log = logging.getLogger("itsm-agent-bot")
 PROTOCOL_VERSION = "2024-11-05"
 JSON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 NOTHING = "Nothing matches"
+# httpx 0.28+ has no per-request ``verify=`` on ``post()``; use a dedicated client when AAP skips TLS verify.
+_HTTP_CLIENT_LIMITS = httpx.Limits(max_keepalive_connections=5, max_connections=10)
 
-# ansible/aap-mcp-server sample toolset `job_management` (override via env).
-DEFAULT_AAP_TOOL_JOB_LIST = "controller.job_templates_list"
-DEFAULT_AAP_TOOL_WFJT_LIST = "controller.workflow_job_templates_list"
+# ansible/aap-mcp-server registers tools from OpenAPI operationIds with dots → underscores (no ``controller.`` prefix).
+# Defaults match bundled controller schema (``job_templates_list``, ``workflow_job_templates_list``).
+def _aap_tool_job_templates_list_name() -> str:
+    v = (os.environ.get("AAP_MCP_TOOL_JOB_LIST") or "job_templates_list").strip()
+    return v or "job_templates_list"
+
+
+def _aap_tool_workflow_job_templates_list_name() -> str:
+    v = (
+        os.environ.get("AAP_MCP_TOOL_WORKFLOW_JOB_TEMPLATES_LIST")
+        or os.environ.get("AAP_MCP_TOOL_WFJT_LIST")
+        or "workflow_job_templates_list"
+    ).strip()
+    return v or "workflow_job_templates_list"
+
+
 MAX_AAP_CANDIDATES = 8
 
-# Path segments match the official multi-toolset MCP layout (see AAP_MCP_BASE_URL).
+# Path pattern matches ansible/aap-mcp-server README: /mcp/{toolset} (not /{toolset}/mcp/).
 AAP_MCP_TOOLSETS = (
     "job_management",
     "inventory_management",
@@ -124,6 +143,80 @@ def _rpc(method: str, params: dict[str, Any] | None, req_id: int) -> dict[str, A
     return msg
 
 
+def _mcp_http_response_jsonrpc_messages(resp: httpx.Response) -> list[dict[str, Any]]:
+    """Parse JSON-RPC object(s) from an MCP HTTP POST response.
+
+    itsm-app returns a single JSON object. Streamable HTTP (aap-mcp-server) returns
+    ``text/event-stream`` frames: ``data: {"jsonrpc":...}`` per event.
+    """
+    raw = resp.text or ""
+    stripped = raw.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict):
+                return [obj]
+            if isinstance(obj, list):
+                return [x for x in obj if isinstance(x, dict)]
+        except json.JSONDecodeError:
+            pass
+    out: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s.startswith("data:"):
+            continue
+        load = s[5:].strip()
+        if not load:
+            continue
+        try:
+            o = json.loads(load)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(o, dict):
+            out.append(o)
+    return out
+
+
+def _mcp_jsonrpc_for_request(messages: list[dict[str, Any]], req_id: int) -> dict[str, Any] | None:
+    """Pick the JSON-RPC response for our request id (Streamable HTTP may emit several ``data:`` lines)."""
+
+    def _same_id(msg: dict[str, Any], rid: int) -> bool:
+        mid = msg.get("id")
+        return mid == rid or str(mid) == str(rid)
+
+    for m in messages:
+        if _same_id(m, req_id):
+            return m
+    for m in messages:
+        r = m.get("result")
+        if isinstance(r, dict) and (
+            r.get("content")
+            or r.get("structuredContent") is not None
+            or isinstance(r.get("results"), list)
+        ):
+            return m
+    for m in reversed(messages):
+        if "result" in m or "error" in m:
+            return m
+    return None
+
+
+def _mcp_streamable_followup_headers(
+    base: dict[str, str], init_response: httpx.Response, init_body: dict[str, Any]
+) -> dict[str, str]:
+    """Headers for POSTs after initialize (Streamable HTTP: session + negotiated protocol)."""
+    out = dict(base)
+    sid = init_response.headers.get("mcp-session-id")
+    if sid:
+        out["mcp-session-id"] = sid
+    res = init_body.get("result")
+    if isinstance(res, dict):
+        pv = res.get("protocolVersion")
+        if isinstance(pv, str) and pv.strip():
+            out["mcp-protocol-version"] = pv.strip()
+    return out
+
+
 def _mcp_headers_itsm(token: str | None) -> dict[str, str]:
     h = dict(JSON_HEADERS)
     if token:
@@ -133,8 +226,11 @@ def _mcp_headers_itsm(token: str | None) -> dict[str, str]:
 
 
 def _mcp_headers_aap(token: str | None) -> dict[str, str]:
-    """Bearer-only auth for AAP MCP (per server README)."""
-    h = dict(JSON_HEADERS)
+    """Bearer auth + Accept for Streamable HTTP MCP (aap-mcp-server requires JSON and SSE types)."""
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h
@@ -266,8 +362,6 @@ async def _mcp_call_tool(
     headers: dict[str, str],
     tool_name: str,
     arguments: dict[str, Any],
-    *,
-    verify: bool = True,
 ) -> Any:
     """Run one MCP tools/call after initialize (stateless HTTP MCP). Returns parsed JSON value."""
     r1 = await client.post(
@@ -283,33 +377,58 @@ async def _mcp_call_tool(
         ),
         headers=headers,
         timeout=120.0,
-        verify=verify,
     )
     r1.raise_for_status()
-    body1 = r1.json()
+    msgs1 = _mcp_http_response_jsonrpc_messages(r1)
+    body1 = _mcp_jsonrpc_for_request(msgs1, 1)
+    if body1 is None:
+        return {
+            "error": "mcp_initialize",
+            "detail": {
+                "message": "no parseable JSON-RPC in MCP response",
+                "content_type": r1.headers.get("content-type"),
+                "snippet": (r1.text or "")[:500],
+            },
+        }
     if "error" in body1:
         return {"error": "mcp_initialize", "detail": body1["error"]}
 
-    await client.post(
+    follow = _mcp_streamable_followup_headers(headers, r1, body1)
+
+    r_mid = await client.post(
         mcp_url,
         json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-        headers=headers,
+        headers=follow,
         timeout=30.0,
-        verify=verify,
     )
+    r_mid.raise_for_status()
 
     r2 = await client.post(
         mcp_url,
         json=_rpc("tools/call", {"name": tool_name, "arguments": arguments}, 2),
-        headers=headers,
+        headers=follow,
         timeout=120.0,
-        verify=verify,
     )
     r2.raise_for_status()
-    body2 = r2.json()
+    msgs2 = _mcp_http_response_jsonrpc_messages(r2)
+    body2 = _mcp_jsonrpc_for_request(msgs2, 2)
+    if body2 is None:
+        return {
+            "error": "mcp_tools_call",
+            "detail": {
+                "message": "no parseable JSON-RPC in MCP response",
+                "content_type": r2.headers.get("content-type"),
+                "snippet": (r2.text or "")[:500],
+            },
+        }
     if "error" in body2:
         return {"error": "mcp_tools_call", "detail": body2["error"]}
     result = body2.get("result") or {}
+    sc = result.get("structuredContent")
+    if isinstance(sc, dict) and isinstance(sc.get("results"), list):
+        return sc
+    if isinstance(result, dict) and isinstance(result.get("results"), list):
+        return result
     content = result.get("content")
     if not isinstance(content, list) or not content:
         return {"error": "mcp_empty_content", "detail": result}
@@ -412,14 +531,15 @@ async def llm_answer(
     for i, row in enumerate(kb_snippets, start=1):
         title = row.get("title", "")
         desc = row.get("description", "")
-        lines.append(f"### KB {i}: {title}\n{desc}\n")
+        lines.append(f"KB excerpt {i} — title: {title}\n{desc}\n")
     context = "\n".join(lines)
     system = (
         "You are a concise IT support assistant. The user message is from an operations chat "
         "(often an incident notification). The knowledge base excerpts were retrieved for you — "
         "summarize how they apply (alert names, remediation, links to workflows). "
         "Use only information supported by the excerpts. If excerpts clearly do not apply, say so briefly "
-        "in one sentence (do not invent KB content)."
+        "in one sentence (do not invent KB content). "
+        "Reply in plain text only: no markdown, no headings, no bold, no bullet lists."
     )
     user_msg = f"User message:\n{user_question}\n\nKnowledge base excerpts:\n{context}"
     headers = {"Content-Type": "application/json"}
@@ -468,28 +588,33 @@ def _kb_fallback_reply(rows: list[dict[str, Any]], *, max_chars: int = 4000) -> 
     for row in rows[:3]:
         title = str(row.get("title", "")).strip()
         desc = str(row.get("description", "")).strip()
-        if title:
-            parts.append(f"**{title}**\n\n{desc}" if desc else f"**{title}**")
+        if title and desc:
+            parts.append(f"{title}\n\n{desc}")
+        elif title:
+            parts.append(title)
         elif desc:
             parts.append(desc)
-    out = "\n\n---\n\n".join(parts).strip()
+    out = "\n\n".join(parts).strip()
     if len(out) > max_chars:
         return out[: max_chars - 1] + "…"
     return out or NOTHING
 
 
 def _aap_mcp_toolset_urls() -> dict[str, str] | None:
-    """Map toolset name → MCP HTTP URL (trailing slash). None if AAP is not configured."""
+    """Map toolset name → MCP HTTP URL. None if AAP is not configured.
+
+    Upstream aap-mcp-server registers POST on ``/mcp``, ``/mcp/{toolset}``, and ``/{toolset}/mcp``.
+    """
     base = os.environ.get("AAP_MCP_BASE_URL", "").strip().rstrip("/")
     if base:
-        return {ts: f"{base}/{ts}/mcp/" for ts in AAP_MCP_TOOLSETS}
+        return {ts: f"{base}/mcp/{ts}" for ts in AAP_MCP_TOOLSETS}
     legacy = os.environ.get("AAP_MCP_URL", "").strip()
     if not legacy:
         return None
     u = legacy.rstrip("/")
     if "/mcp" not in u:
         u = u + "/mcp"
-    return {"legacy": u + "/"}
+    return {"legacy": u}
 
 
 def _aap_job_management_mcp_url() -> str | None:
@@ -503,6 +628,38 @@ def _aap_configured() -> bool:
     return _aap_job_management_mcp_url() is not None
 
 
+_AAP_APPENDIX_405 = (
+    "AAP: HTTP POST was rejected (405) on the configured MCP URL. "
+    "AAP_MCP_BASE_URL is probably the AAP web console host, not ansible/aap-mcp-server. "
+    "Use the MCP server Route URL (POST …/mcp/job_management returns JSON-RPC), or set AAP_MCP_URL to that full endpoint."
+)
+
+
+async def _aap_warn_if_mcp_url_looks_like_ui(mcp_url: str) -> None:
+    """Log when GET on the job MCP URL looks like a static SPA, not an MCP HTTP server."""
+    try:
+        tls = _aap_tls_verify_enabled()
+        async with httpx.AsyncClient(
+            limits=_HTTP_CLIENT_LIMITS,
+            follow_redirects=True,
+            verify=tls,
+        ) as c:
+            r = await c.get(mcp_url, timeout=15.0, headers={"Accept": "*/*"})
+    except Exception as e:
+        log.debug("AAP MCP URL probe (GET) failed for %s: %s", mcp_url, e)
+        return
+    ct = (r.headers.get("content-type") or "").lower()
+    if r.is_success and "text/html" in ct:
+        log.warning(
+            "AAP job MCP URL %s returned HTTP %s with Content-Type %r — likely the AAP **browser UI**, "
+            "not **aap-mcp-server**. MCP appendix POSTs will get HTTP 405 until you point "
+            "AAP_MCP_BASE_URL / AAP_MCP_URL at the MCP HTTP service.",
+            mcp_url,
+            r.status_code,
+            (r.headers.get("content-type") or "")[:100],
+        )
+
+
 def _tower_results(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict) and isinstance(payload.get("results"), list):
         return [x for x in payload["results"] if isinstance(x, dict)]
@@ -511,63 +668,134 @@ def _tower_results(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _extract_aap_candidates(kb_rows: list[dict[str, Any]]) -> list[str]:
-    """Infer workflow / job template names from KB title+description (heuristic)."""
-    blob_parts: list[str] = []
-    for row in kb_rows[:5]:
-        t = str(row.get("title", "") or "")
-        d = str(row.get("description", "") or "")
-        if t.strip():
-            blob_parts.append(t)
-        if d.strip():
-            blob_parts.append(d)
-    blob = "\n".join(blob_parts)
-    found: list[str] = []
+def _strip_trailing_kb_field_noise(s: str) -> str:
+    """Remove trailing structured KB fields accidentally captured on the same line as a template name."""
+    s = s.strip()
+    s = re.sub(r"(?is)\s+Description\s*:.*$", "", s)
+    s = re.sub(r"(?is)\s+Alert\s+name\s*:.*$", "", s)
+    s = re.sub(r"(?is)\s+AAP\s+Remediation\s*:.*$", "", s)
+    return s.rstrip(" \t.;:|\"'").strip()
+
+
+def _aap_search_terms(candidate: str) -> list[str]:
+    """Build Tower ``search`` query variants (brackets often break single-string search)."""
+    c = candidate.strip()
+    out: list[str] = []
     seen: set[str] = set()
 
-    def add(raw: str) -> None:
-        x = raw.strip().strip("`\"'")
-        if len(x) < 3 or len(x) > 200:
+    def add(s: str) -> None:
+        t = s.strip()
+        if len(t) < 2:
             return
-        k = x.lower()
+        k = t.lower()
         if k in seen:
             return
         seen.add(k)
+        out.append(t)
+
+    add(c)
+    stripped = re.sub(r"^\[[^\]]+\]\s*", "", c).strip()
+    if stripped:
+        add(stripped)
+    no_brackets = re.sub(r"[\[\]]", " ", c)
+    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+    if no_brackets.lower() != c.lower():
+        add(no_brackets)
+    return out[:5]
+
+
+def _aap_norm_template_label(s: str) -> str:
+    """Lowercase label with brackets removed (Tower names vs KB strings)."""
+    s = str(s or "").lower()
+    s = re.sub(r"[\[\]]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _extract_aap_candidates(kb_rows: list[dict[str, Any]]) -> list[str]:
+    """Infer job / workflow job template names from KB (prefer AAP Remediation and quoted template lines)."""
+    blob_parts: list[str] = []
+    for row in kb_rows[:6]:
+        for key in ("title", "description"):
+            chunk = str(row.get(key, "") or "").strip()
+            if chunk:
+                blob_parts.append(chunk)
+    blob = "\n".join(blob_parts)
+
+    patterns: list[tuple[str, int]] = [
+        (r'(?is)AAP\s*Remediation\s*:\s*Workflow\s+job\s+template\s*"([^"]+)"', 1),
+        (r'(?is)AAP\s*Remediation\s*:\s*Job\s+template\s*"([^"]+)"', 1),
+        (r'(?is)\bWorkflow\s+job\s+template\s*"([^"]+)"', 1),
+        (r'(?is)\bJob\s+template\s*"([^"]+)"', 1),
+        (r"(?is)\bWorkflow\s+job\s+template\s*:\s*([^\n]+)", 1),
+        (r"(?is)\bJob\s+template\s*:\s*([^\n]+)", 1),
+    ]
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def consider(raw: str) -> None:
+        x = raw.strip().strip('`"\'')
+        x = _strip_trailing_kb_field_noise(x)
+        if "\n" in x:
+            x = x.split("\n", 1)[0].strip()
+        x = _strip_trailing_kb_field_noise(x)
+        low = x.lower()
+        if len(x) < 2 or len(x) > 200:
+            return
+        if low.startswith("workflow job template") or low.startswith("job template"):
+            return
+        if low in seen:
+            return
+        seen.add(low)
         found.append(x)
 
-    for m in re.finditer(r'"\s*\[WF\]\s*([^"]+)"', blob, flags=re.I):
-        add(m.group(1))
-    for m in re.finditer(r"\[WF\]\s*([^\n\]]+)", blob, flags=re.I):
-        add(m.group(1))
-    for m in re.finditer(r"`([^`\n]{3,120})`", blob):
-        add(m.group(1))
-    for m in re.finditer(
-        r"(?im)\b(?:workflow\s+job\s+template|job\s+template)\s*[:\-]\s*([^\n]+)",
-        blob,
-    ):
-        add(m.group(1))
-    low = blob.lower()
-    if "aap remediation" in low or "remediation:" in low:
-        for line in blob.splitlines():
-            ln = line.strip()
-            if re.search(r"(?i)remediation|workflow|job template", ln) and len(ln) < 220:
-                if ":" in ln:
-                    add(ln.split(":", 1)[-1])
-    out: list[str] = []
-    for c in found:
-        if c.lower().startswith("workflow job template"):
-            continue
-        out.append(c)
-    return out[:MAX_AAP_CANDIDATES]
+    for pat, grp in patterns:
+        for m in re.finditer(pat, blob):
+            consider(m.group(grp))
+
+    for m in re.finditer(r'"(\[[^\]]+\][^"]{0,180})"', blob):
+        consider(m.group(1))
+
+    for m in re.finditer(r"`([^`\n]{2,120})`", blob):
+        consider(m.group(1))
+
+    return found[:MAX_AAP_CANDIDATES]
+
+
+def _row_matches_aap_template_name(row: dict[str, Any], candidate: str) -> bool:
+    name = str(row.get("name", "") or "")
+    nl = name.lower()
+    c = candidate.strip().lower()
+    if not c or not nl:
+        return False
+    if c in nl:
+        return True
+    c_alt = re.sub(r"^\[[^\]]+\]\s*", "", c).strip()
+    if len(c_alt) >= 3 and c_alt in nl:
+        return True
+    cn = _aap_norm_template_label(candidate)
+    nn = _aap_norm_template_label(name)
+    if len(cn) >= 3 and cn in nn:
+        return True
+    if len(nn) >= 3 and nn in cn:
+        return True
+    if cn and cn == nn:
+        return True
+    return False
 
 
 def _rows_matching_candidate(rows: list[dict[str, Any]], candidate: str) -> list[dict[str, Any]]:
-    c = candidate.lower()
     out: list[dict[str, Any]] = []
+    seen: set[Any] = set()
     for r in rows:
-        name = str(r.get("name", "") or "")
-        if c in name.lower():
-            out.append(r)
+        if not _row_matches_aap_template_name(r, candidate):
+            continue
+        rid = r.get("id")
+        if rid in seen:
+            continue
+        seen.add(rid)
+        out.append(r)
     return out
 
 
@@ -575,12 +803,12 @@ def _summarize_template_row(kind: str, r: dict[str, Any]) -> str:
     tid = r.get("id", "?")
     name = str(r.get("name", "") or "?").strip()
     desc = str(r.get("description", "") or "").strip()
-    if len(desc) > 400:
-        desc = desc[:399] + "…"
-    bits = [f"- **{kind}** `{name}` (id={tid})"]
+    if len(desc) > 280:
+        desc = desc[:279] + "…"
+    line = f"  - {kind}: {name} (id={tid})"
     if desc:
-        bits.append(f"  {desc}")
-    return "\n".join(bits)
+        line += f" — {desc}"
+    return line
 
 
 async def aap_build_appendix(
@@ -589,44 +817,99 @@ async def aap_build_appendix(
     aap_token: str | None,
     candidates: list[str],
 ) -> str:
-    """Return markdown block for chat: AAP template presence for each candidate."""
+    """Return extra plain-text paragraph for chat: AAP template presence for each candidate."""
     if not candidates:
         return ""
-    verify = _aap_tls_verify_enabled()
-    if not verify:
+    tls_verify = _aap_tls_verify_enabled()
+    if not tls_verify:
         log.warning(
             "AAP MCP TLS certificate verification is disabled (AAP_TLS_VERIFY / TLS_VERIFY); "
             "use only on trusted networks."
         )
+
     headers = _mcp_headers_aap(aap_token)
-    tool_j = DEFAULT_AAP_TOOL_JOB_LIST
-    tool_w = DEFAULT_AAP_TOOL_WFJT_LIST
-    lines: list[str] = ["**AAP** (job / workflow job templates)"]
-    for cand in candidates:
-        j_raw = await _mcp_call_tool(
-            client, aap_url, headers, tool_j, {"search": cand, "page_size": 50}, verify=verify
-        )
-        w_raw = await _mcp_call_tool(
-            client, aap_url, headers, tool_w, {"search": cand, "page_size": 50}, verify=verify
-        )
-        if isinstance(j_raw, dict) and j_raw.get("error"):
-            log.warning("AAP %s failed for %r: %s", tool_j, cand, j_raw.get("error"))
-        if isinstance(w_raw, dict) and w_raw.get("error"):
-            log.warning("AAP %s failed for %r: %s", tool_w, cand, w_raw.get("error"))
-        j_rows = _rows_matching_candidate(_tower_results(j_raw), cand)
-        w_rows = _rows_matching_candidate(_tower_results(w_raw), cand)
-        if j_rows or w_rows:
-            lines.append(f"- **{cand}** — found in AAP:")
-            for r in j_rows[:5]:
-                lines.append(_summarize_template_row("Job template", r))
-            for r in w_rows[:5]:
-                lines.append(_summarize_template_row("Workflow job template", r))
-        else:
-            lines.append(
-                f"- **{cand}** — no matching job template or workflow job template found in AAP "
-                f"(for this search; KB may still reference a differently named object)."
-            )
-    return "\n".join(lines)
+    tool_j = _aap_tool_job_templates_list_name()
+    tool_w = _aap_tool_workflow_job_templates_list_name()
+    lines: list[str] = ["AAP (job / workflow job templates):"]
+
+    async def _run(c: httpx.AsyncClient) -> str:
+        for cand in candidates:
+            terms = _aap_search_terms(cand)
+            merged_j: dict[Any, dict[str, Any]] = {}
+            merged_w: dict[Any, dict[str, Any]] = {}
+            j_rows: list[dict[str, Any]] = []
+            w_rows: list[dict[str, Any]] = []
+            for term in terms:
+                try:
+                    j_raw = await _mcp_call_tool(
+                        c, aap_url, headers, tool_j, {"search": term, "page_size": 100}
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 405:
+                        log.error(
+                            "AAP MCP POST returned 405 for %s — host is not the streamable HTTP MCP server "
+                            "(often the AAP UI Route).",
+                            e.request.url,
+                        )
+                        return _AAP_APPENDIX_405
+                    raise
+                w_raw = await _mcp_call_tool(
+                    c, aap_url, headers, tool_w, {"search": term, "page_size": 100}
+                )
+                if isinstance(j_raw, dict) and j_raw.get("error"):
+                    log.warning(
+                        "AAP %s search=%r candidate=%r: %s",
+                        tool_j,
+                        term,
+                        cand,
+                        j_raw.get("detail") if isinstance(j_raw.get("detail"), (dict, str)) else j_raw,
+                    )
+                if isinstance(w_raw, dict) and w_raw.get("error"):
+                    log.warning(
+                        "AAP %s search=%r candidate=%r: %s",
+                        tool_w,
+                        term,
+                        cand,
+                        w_raw.get("detail") if isinstance(w_raw.get("detail"), (dict, str)) else w_raw,
+                    )
+                for r in _tower_results(j_raw):
+                    rid = r.get("id")
+                    if rid is not None:
+                        merged_j[rid] = r
+                for r in _tower_results(w_raw):
+                    rid = r.get("id")
+                    if rid is not None:
+                        merged_w[rid] = r
+                j_rows = _rows_matching_candidate(list(merged_j.values()), cand)
+                w_rows = _rows_matching_candidate(list(merged_w.values()), cand)
+                if j_rows or w_rows:
+                    break
+            if j_rows or w_rows:
+                lines.append(f"- {cand}: found in AAP")
+                for r in j_rows[:5]:
+                    lines.append(_summarize_template_row("Job template", r))
+                for r in w_rows[:5]:
+                    lines.append(_summarize_template_row("Workflow job template", r))
+            else:
+                log.info(
+                    "AAP no template match for candidate=%r after search terms=%s (merged job rows=%s wfjt rows=%s)",
+                    cand,
+                    terms,
+                    len(merged_j),
+                    len(merged_w),
+                )
+                lines.append(
+                    f"- {cand}: no matching job or workflow job template in AAP for this search "
+                    f"(KB name may differ slightly from the controller object name)."
+                )
+        return "\n".join(lines)
+
+    if tls_verify:
+        return await _run(client)
+    async with httpx.AsyncClient(
+        limits=_HTTP_CLIENT_LIMITS, follow_redirects=True, verify=False
+    ) as aap_client:
+        return await _run(aap_client)
 
 
 def _subscribe_payload() -> dict[str, Any]:
@@ -664,8 +947,7 @@ async def run_bot() -> None:
     aap_urls = _aap_mcp_toolset_urls()
     aap_job_mcp_url = _aap_job_management_mcp_url()
 
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    async with httpx.AsyncClient(limits=limits, follow_redirects=True) as http:
+    async with httpx.AsyncClient(limits=_HTTP_CLIENT_LIMITS, follow_redirects=True) as http:
         token = await chat_login(http, chat_base, chat_user, chat_pass)
         me = await chat_me(http, chat_base, token)
         my_id = me.get("id")
@@ -693,6 +975,8 @@ async def run_bot() -> None:
                     len(aap_urls),
                     (aap_job_mcp_url or "").rstrip("/"),
                 )
+                if aap_job_mcp_url:
+                    await _aap_warn_if_mcp_url_looks_like_ui(aap_job_mcp_url)
 
             async for message in ws:
                 if isinstance(message, bytes):
