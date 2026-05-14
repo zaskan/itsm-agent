@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+.env
+*.egg-info/
+dist/
+build/
+k8s/secret.yaml

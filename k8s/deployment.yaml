@@ -1,0 +1,70 @@
+# Image must resolve to your cluster registry (not docker.io). After:
+#   oc new-build --name=itsm-agent --binary --strategy=docker -n itsm-agent
+#   oc start-build itsm-agent --from-dir=. --follow -n itsm-agent
+# use the ImageStream’s dockerImageRepository, or the path below when
+# namespace and ImageStream name are both "itsm-agent".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: itsm-agent
+  namespace: itsm-agent
+  labels:
+    app: itsm-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: itsm-agent
+  template:
+    metadata:
+      labels:
+        app: itsm-agent
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bot
+          image: image-registry.openshift-image-registry.svc:5000/itsm-agent/itsm-agent:latest
+          # Always: after `oc start-build`, nodes actually pull the new digest for :latest.
+          # IfNotPresent often keeps an old layer cache when the tag string is unchanged.
+          imagePullPolicy: Always
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: itsm-agent-secrets
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 12
