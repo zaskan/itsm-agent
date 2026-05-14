@@ -29,11 +29,19 @@ Optional AAP MCP (same layout as Cursor ``mcpServers`` HTTP entries — only URL
   AAP_MCP_TOKEN       — Bearer AAP OAuth2 token for ``Authorization`` (empty only if your gateway injects auth).
   AAP_MCP_TOOL_JOB_LIST — optional; MCP tool name for job template list (default: ``job_templates_list``).
   AAP_MCP_TOOL_WFJT_LIST — optional; MCP tool name for workflow job template list (default: ``workflow_job_templates_list``).
+  AAP_MCP_TOOL_JOB_TEMPLATES_LAUNCH / AAP_MCP_TOOL_WORKFLOW_JOB_TEMPLATES_LAUNCH — optional launch tool names
+                        (defaults: ``job_templates_launch_create``, ``workflow_job_templates_launch_create``).
+  AAP_MCP_TOOL_JOBS_RETRIEVE / AAP_MCP_TOOL_WORKFLOW_JOBS_RETRIEVE — optional poll tool names (defaults: ``jobs_retrieve``, ``workflow_jobs_retrieve``).
+  AAP_CONTROLLER_UI_URL — optional; controller web UI origin for job output links when Tower does not return ``html_url``.
+  AAP_JOB_POLL_INTERVAL_SEC — seconds between status polls (default 5).
+  AAP_JOB_POLL_TIMEOUT_SEC — max seconds to poll before timeout message (default 3600).
   AAP_TLS_VERIFY      — optional; set ``false`` / ``0`` to disable TLS verification **for AAP MCP only** (e.g.
                         self-signed ingress). Uses a dedicated ``httpx`` client with ``verify=False`` (httpx 0.28+
                         has no per-request ``verify``). If unset, ``TLS_VERIFY`` is checked the same way for AAP only.
                         Default: verify. Unsafe on untrusted networks.
   AAP_MCP_URL         — (legacy) full single MCP URL if you cannot use ``AAP_MCP_BASE_URL`` yet.
+
+Launching jobs requires **ALLOW_WRITE_OPERATIONS=true** on the aap-mcp-server deployment and a token with execute permission on the template.
 
 Optional:
   RAG_TOP_K           — default 5
@@ -42,6 +50,7 @@ Optional:
 Retrieval uses itsm-app MCP rag_search_kb. After KB hits, the bot can call AAP MCP
 ``job_templates_list`` / ``workflow_job_templates_list`` (names from the controller OpenAPI in aap-mcp-server)
 with a ``search`` query for each template name inferred from KB text, then append an **AAP** section to the reply.
+If a template is found, the bot asks whether to launch it; the user can confirm with ``@<bot_username> yes`` (plain text).
 LiteLLM is used only for the KB summary (unchanged).
 """
 
@@ -53,7 +62,9 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.parse
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -85,7 +96,51 @@ def _aap_tool_workflow_job_templates_list_name() -> str:
     return v or "workflow_job_templates_list"
 
 
+def _aap_tool_job_templates_launch_name() -> str:
+    v = (os.environ.get("AAP_MCP_TOOL_JOB_TEMPLATES_LAUNCH") or "job_templates_launch_create").strip()
+    return v or "job_templates_launch_create"
+
+
+def _aap_tool_workflow_job_templates_launch_name() -> str:
+    v = (
+        os.environ.get("AAP_MCP_TOOL_WORKFLOW_JOB_TEMPLATES_LAUNCH")
+        or "workflow_job_templates_launch_create"
+    ).strip()
+    return v or "workflow_job_templates_launch_create"
+
+
+def _aap_tool_jobs_retrieve_name() -> str:
+    v = (os.environ.get("AAP_MCP_TOOL_JOBS_RETRIEVE") or "jobs_retrieve").strip()
+    return v or "jobs_retrieve"
+
+
+def _aap_tool_workflow_jobs_retrieve_name() -> str:
+    v = (os.environ.get("AAP_MCP_TOOL_WORKFLOW_JOBS_RETRIEVE") or "workflow_jobs_retrieve").strip()
+    return v or "workflow_jobs_retrieve"
+
+
+def _aap_job_poll_interval_sec() -> float:
+    return max(2.0, float(os.environ.get("AAP_JOB_POLL_INTERVAL_SEC", "5")))
+
+
+def _aap_job_poll_timeout_sec() -> float:
+    return max(60.0, float(os.environ.get("AAP_JOB_POLL_TIMEOUT_SEC", str(3600))))
+
+
 MAX_AAP_CANDIDATES = 8
+
+# Latest offered launch per channel (in-memory; single long-lived bot process).
+@dataclass
+class PendingLaunchOffer:
+    kind: str  # "workflow" | "job"
+    template_id: int
+    template_name: str
+    channel_id: str
+
+
+pending_launch_by_channel: dict[str, PendingLaunchOffer] = {}
+aap_active_monitor_tasks: dict[str, asyncio.Task[Any]] = {}
+
 
 # Path pattern matches ansible/aap-mcp-server README: /mcp/{toolset} (not /{toolset}/mcp/).
 AAP_MCP_TOOLSETS = (
@@ -112,6 +167,10 @@ def _env(name: str, default: str | None = None) -> str:
 def _optional_env(name: str) -> str | None:
     v = os.environ.get(name, "").strip()
     return v or None
+
+
+def _aap_controller_ui_base() -> str | None:
+    return _optional_env("AAP_CONTROLLER_UI_URL")
 
 
 def _ws_url(chat_base: str, token: str) -> str:
@@ -811,15 +870,76 @@ def _summarize_template_row(kind: str, r: dict[str, Any]) -> str:
     return line
 
 
+def _body_mentions_username(body: str, username: str) -> bool:
+    u = (username or "").strip()
+    if not u:
+        return False
+    return re.search(rf"(?i)@{re.escape(u)}\b", body) is not None
+
+
+def _body_is_affirmative_launch(body: str) -> bool:
+    stripped = re.sub(r"(?i)@\w[\w.-]*\s*", " ", body).strip()
+    return bool(
+        re.search(
+            r"(?i)\b(yes|yeah|yep|sure|ok|okay|please|launch|go\s+ahead|do\s+it)\b",
+            stripped,
+        )
+    )
+
+
+def _aap_launched_job_record(payload: Any) -> dict[str, Any] | None:
+    """Normalize Tower launch response to a job / workflow_job dict with id and type."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    if payload.get("id") is not None and isinstance(payload.get("type"), str):
+        return payload
+    for key in ("workflow_job", "job"):
+        inner = payload.get(key)
+        if isinstance(inner, dict) and inner.get("id") is not None:
+            return inner
+    return None
+
+
+def _aap_retrieve_tool_for_record(rec: dict[str, Any]) -> str:
+    t = str(rec.get("type") or "").lower()
+    if "workflow" in t:
+        return _aap_tool_workflow_jobs_retrieve_name()
+    return _aap_tool_jobs_retrieve_name()
+
+
+def _aap_terminal_job_status(status: str | None) -> bool:
+    if not status:
+        return False
+    return status.lower() in {"successful", "failed", "error", "canceled", "cancelled"}
+
+
+def _aap_job_output_url(rec: dict[str, Any]) -> str | None:
+    hu = rec.get("html_url")
+    if isinstance(hu, str) and hu.startswith("http"):
+        return hu
+    jid = rec.get("id")
+    if jid is None:
+        return None
+    base = _aap_controller_ui_base()
+    if not base:
+        return None
+    b = base.rstrip("/")
+    t = str(rec.get("type") or "").lower()
+    if "workflow" in t:
+        return f"{b}/#/jobs/workflow/{jid}/output"
+    return f"{b}/#/jobs/playbook/{jid}/output"
+
+
 async def aap_build_appendix(
     client: httpx.AsyncClient,
     aap_url: str,
     aap_token: str | None,
     candidates: list[str],
-) -> str:
-    """Return extra plain-text paragraph for chat: AAP template presence for each candidate."""
+    channel_id: str,
+) -> tuple[str, PendingLaunchOffer | None]:
+    """Return AAP appendix plain text and an optional single launch offer (first matched candidate; WFJT over JT)."""
     if not candidates:
-        return ""
+        return "", None
     tls_verify = _aap_tls_verify_enabled()
     if not tls_verify:
         log.warning(
@@ -831,8 +951,10 @@ async def aap_build_appendix(
     tool_j = _aap_tool_job_templates_list_name()
     tool_w = _aap_tool_workflow_job_templates_list_name()
     lines: list[str] = ["AAP (job / workflow job templates):"]
+    chosen: PendingLaunchOffer | None = None
 
-    async def _run(c: httpx.AsyncClient) -> str:
+    async def _run(c: httpx.AsyncClient) -> tuple[str, PendingLaunchOffer | None]:
+        nonlocal chosen
         for cand in candidates:
             terms = _aap_search_terms(cand)
             merged_j: dict[Any, dict[str, Any]] = {}
@@ -851,7 +973,7 @@ async def aap_build_appendix(
                             "(often the AAP UI Route).",
                             e.request.url,
                         )
-                        return _AAP_APPENDIX_405
+                        return _AAP_APPENDIX_405, None
                     raise
                 w_raw = await _mcp_call_tool(
                     c, aap_url, headers, tool_w, {"search": term, "page_size": 100}
@@ -890,6 +1012,17 @@ async def aap_build_appendix(
                     lines.append(_summarize_template_row("Job template", r))
                 for r in w_rows[:5]:
                     lines.append(_summarize_template_row("Workflow job template", r))
+                if chosen is None:
+                    pick = w_rows[0] if w_rows else j_rows[0]
+                    tid = pick.get("id")
+                    if tid is not None:
+                        kind = "workflow" if w_rows else "job"
+                        chosen = PendingLaunchOffer(
+                            kind=kind,
+                            template_id=int(tid),
+                            template_name=str(pick.get("name", "") or "").strip() or str(tid),
+                            channel_id=channel_id,
+                        )
             else:
                 log.info(
                     "AAP no template match for candidate=%r after search terms=%s (merged job rows=%s wfjt rows=%s)",
@@ -902,7 +1035,7 @@ async def aap_build_appendix(
                     f"- {cand}: no matching job or workflow job template in AAP for this search "
                     f"(KB name may differ slightly from the controller object name)."
                 )
-        return "\n".join(lines)
+        return "\n".join(lines), chosen
 
     if tls_verify:
         return await _run(client)
@@ -910,6 +1043,119 @@ async def aap_build_appendix(
         limits=_HTTP_CLIENT_LIMITS, follow_redirects=True, verify=False
     ) as aap_client:
         return await _run(aap_client)
+
+
+async def _aap_call_mcp_tool_with_tls(
+    base_http: httpx.AsyncClient,
+    aap_url: str,
+    aap_token: str | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    if _aap_tls_verify_enabled():
+        return await _mcp_call_tool(base_http, aap_url, _mcp_headers_aap(aap_token), tool_name, arguments)
+    async with httpx.AsyncClient(
+        limits=_HTTP_CLIENT_LIMITS, follow_redirects=True, verify=False
+    ) as c:
+        return await _mcp_call_tool(c, aap_url, _mcp_headers_aap(aap_token), tool_name, arguments)
+
+
+async def _aap_monitor_job_and_notify(
+    ws: Any,
+    base_http: httpx.AsyncClient,
+    aap_url: str,
+    aap_token: str | None,
+    job_rec: dict[str, Any],
+    channel_id: str,
+    template_name: str,
+) -> None:
+    try:
+        jid = int(job_rec["id"])
+    except (TypeError, ValueError, KeyError):
+        log.warning("AAP monitor: missing job id in %s", job_rec)
+        return
+    tool = _aap_retrieve_tool_for_record(job_rec)
+    deadline = time.monotonic() + _aap_job_poll_timeout_sec()
+    last_status = ""
+    while time.monotonic() < deadline:
+        raw = await _aap_call_mcp_tool_with_tls(base_http, aap_url, aap_token, tool, {"id": jid})
+        rec: dict[str, Any] | None = None
+        if isinstance(raw, dict) and raw.get("error"):
+            log.warning("AAP job poll %s id=%s: %s", tool, jid, raw.get("detail", raw))
+            break
+        if isinstance(raw, dict):
+            rec = raw if raw.get("status") is not None else _aap_launched_job_record(raw)
+        if isinstance(rec, dict):
+            st = str(rec.get("status") or "")
+            last_status = st
+            if _aap_terminal_job_status(st):
+                url = _aap_job_output_url(rec)
+                outcome = st.capitalize()
+                msg = f"The job {template_name} (run id={jid}) finished {outcome}."
+                if url:
+                    msg += f" Details: {url}"
+                await ws.send(json.dumps(_send_payload(msg)))
+                return
+        await asyncio.sleep(_aap_job_poll_interval_sec())
+    url = _aap_job_output_url(
+        {"id": jid, "type": str(job_rec.get("type") or "")}
+    )
+    tail = f" Run id={jid} last status was {last_status or 'unknown'} when the poll timed out."
+    if url:
+        tail += f" Check the controller: {url}"
+    await ws.send(
+        json.dumps(_send_payload(f"The job {template_name} is still running or pending.{tail}"))
+    )
+
+
+async def aap_try_launch_from_offer(
+    ws: Any,
+    base_http: httpx.AsyncClient,
+    aap_url: str,
+    aap_token: str | None,
+    offer: PendingLaunchOffer,
+) -> str:
+    cid = offer.channel_id
+    prev = aap_active_monitor_tasks.get(cid)
+    if prev is not None and not prev.done():
+        return (
+            "A job is already being monitored in this channel; wait for it to finish before launching another."
+        )
+    tname = (
+        _aap_tool_workflow_job_templates_launch_name()
+        if offer.kind == "workflow"
+        else _aap_tool_job_templates_launch_name()
+    )
+    args = {"id": offer.template_id, "requestBody": {}}
+    raw = await _aap_call_mcp_tool_with_tls(base_http, aap_url, aap_token, tname, args)
+    if isinstance(raw, dict) and raw.get("error"):
+        log.error("AAP launch failed offer=%s raw=%s", offer, raw)
+        return f"Launch failed: {raw.get('detail', raw)}"
+    job_rec = _aap_launched_job_record(raw)
+    if not job_rec:
+        return f"Launch returned an unexpected response: {str(raw)[:400]}"
+    try:
+        jid = int(job_rec["id"])
+    except (TypeError, ValueError, KeyError):
+        return "Launch succeeded but the response had no job id."
+    pending_launch_by_channel.pop(cid, None)
+    kind_label = "workflow job" if offer.kind == "workflow" else "job"
+    ack = (
+        f"Launched the {kind_label} template {offer.template_name}. The run id is {jid}. "
+        "I will post again when it finishes."
+    )
+    task = asyncio.create_task(
+        _aap_monitor_job_and_notify(
+            ws, base_http, aap_url, aap_token, job_rec, cid, offer.template_name
+        )
+    )
+    aap_active_monitor_tasks[cid] = task
+
+    def _cleanup(_t: asyncio.Task[Any]) -> None:
+        aap_active_monitor_tasks.pop(cid, None)
+
+    task.add_done_callback(_cleanup)
+    return ack
 
 
 def _subscribe_payload() -> dict[str, Any]:
@@ -994,6 +1240,55 @@ async def run_bot() -> None:
                 body = payload.get("body")
                 if not isinstance(body, str) or not body.strip():
                     continue
+                ch_id = str(
+                    payload.get("channel_id") or ev0.get("channel_id") or _optional_env("CHANNEL_ID") or ""
+                )
+                bot_username = str(me.get("username") or "")
+
+                if _body_mentions_username(body, bot_username):
+                    if ch_id in pending_launch_by_channel and not _body_is_affirmative_launch(body):
+                        await ws.send(
+                            json.dumps(
+                                _send_payload(
+                                    "Reply with yes or launch if you want me to run the template I offered, "
+                                    "or send a new incident without @mention."
+                                )
+                            )
+                        )
+                        continue
+                    if _body_is_affirmative_launch(body):
+                        if not (_aap_configured() and aap_job_mcp_url):
+                            await ws.send(
+                                json.dumps(
+                                    _send_payload("AAP launch is not configured (missing URL or token).")
+                                )
+                            )
+                            continue
+                        if ch_id not in pending_launch_by_channel:
+                            await ws.send(
+                                json.dumps(
+                                    _send_payload(
+                                        "There is no job or workflow template waiting to launch. "
+                                        "Post an incident first so I can suggest one from the knowledge base."
+                                    )
+                                )
+                            )
+                            continue
+                        offer = pending_launch_by_channel[ch_id]
+                        try:
+                            reply = await aap_try_launch_from_offer(
+                                ws,
+                                http,
+                                aap_job_mcp_url,
+                                _optional_env("AAP_MCP_TOKEN"),
+                                offer,
+                            )
+                        except Exception:
+                            log.exception("AAP launch")
+                            reply = "Launch failed due to an internal error."
+                        await ws.send(json.dumps(_send_payload(reply)))
+                        continue
+
                 query = _query_from_channel_body(body)
                 log.info(
                     "Handling user_id=%s RAG query (len=%s): %s",
@@ -1016,14 +1311,24 @@ async def run_bot() -> None:
                             cands = _extract_aap_candidates(rows)
                             if cands:
                                 try:
-                                    apx = await aap_build_appendix(
+                                    apx, launch_offer = await aap_build_appendix(
                                         http,
                                         aap_job_mcp_url,
                                         _optional_env("AAP_MCP_TOKEN"),
                                         cands,
+                                        ch_id,
                                     )
                                     if apx:
                                         reply = f"{reply.rstrip()}\n\n{apx}"
+                                    if launch_offer and ch_id:
+                                        pending_launch_by_channel[ch_id] = launch_offer
+                                        reply = (
+                                            f"{reply.rstrip()}\n\nDo you want me to launch the job for you?"
+                                        )
+                                    elif launch_offer and not ch_id:
+                                        log.warning(
+                                            "AAP launch offer skipped: could not resolve channel_id from event"
+                                        )
                                 except Exception:
                                     log.exception("AAP lookup appendix failed")
                 except Exception:
