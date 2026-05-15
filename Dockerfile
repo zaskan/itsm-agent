@@ -5,10 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py /app/bot.py
+COPY bot /app/bot
 COPY src /app/src
 
-RUN chmod -R a+rX /app/bot.py /app/src
+RUN chmod -R a+rX /app/bot /app/src
 
 ENV PYTHONPATH=/app/src
 

@@ -1,6 +1,6 @@
 """Entrypoint for `python -m itsm_agent.main` (matches common OpenShift / image CMD).
 
-Configuration and behavior live in ``bot.py`` at the application root (LiteLLM
+Configuration and behavior live in the ``bot`` package at the application root (LiteLLM
 ``/v1/chat/completions`` + itsm-app MCP ``rag_search_kb``). This module only adds
 the repo root to ``sys.path`` and delegates so cluster Secrets can keep using
 ``CHAT_BASE_URL``, ``LLM_*``, and ``ITSM_BASE_URL`` without a separate Pydantic
@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 def _app_root() -> Path:
-    # .../src/itsm_agent/main.py -> parents[2] == app root (contains bot.py)
+    # .../src/itsm_agent/main.py -> parents[2] == app root (contains bot/)
     return Path(__file__).resolve().parents[2]
 
 
