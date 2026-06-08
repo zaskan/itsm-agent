@@ -52,6 +52,7 @@ def extract_aap_candidates(kb_rows: list[dict[str, Any]]) -> list[str]:
     )
     patterns = [
         (r"(?is)Launch AAP workflow \*\*([^*]+)\*\*", 1),
+        (r"(?is)(?:After confirmation,\s*)?launch\s+\*\*([^*]+)\*\*", 1),
         (r'(?is)AAP\s*Remediation\s*:\s*Workflow\s+job\s+template\s*"([^"]+)"', 1),
         (r'(?is)AAP\s*Remediation\s*:\s*Job\s+template\s*"([^"]+)"', 1),
         (r'(?is)\bWorkflow\s+job\s+template\s*"([^"]+)"', 1),
@@ -70,6 +71,8 @@ def extract_aap_candidates(kb_rows: list[dict[str, Any]]) -> list[str]:
         low = x.lower()
         if re.fullmatch(r"[a-z][a-z0-9_]*", x):
             return
+        if x.startswith("[") or x.startswith("#") or x.upper() in {"INC-*"}:
+            return
         if len(x) < 2 or len(x) > 200 or low.startswith(("workflow job template", "job template")) or low in seen:
             return
         seen.add(low)
@@ -86,14 +89,16 @@ def extract_aap_candidates(kb_rows: list[dict[str, Any]]) -> list[str]:
 
 
 def extract_template_from_kb(kb_rows: list[dict[str, Any]]) -> str | None:
+    cands = extract_aap_candidates(kb_rows)
+    if cands:
+        return cands[0]
     for row in kb_rows[:3]:
         title = str(row.get("title", "") or "").strip()
         if title:
             base = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
             if len(base) >= 5:
                 return base
-    cands = extract_aap_candidates(kb_rows)
-    return cands[0] if cands else None
+    return None
 
 
 def _search_queries(name: str, *, max_q: int = 2) -> list[str]:
@@ -208,7 +213,8 @@ def _extra_vars(collected: dict[str, str]) -> dict[str, Any] | str:
         return {}
     if len(collected) == 1 and "user_input" in collected:
         return collected["user_input"]
-    return {k: _coerce_value(v) for k, v in collected.items()}
+    skip = frozenset({"user_input"})
+    return {k: _coerce_value(v) for k, v in collected.items() if k not in skip}
 
 
 async def launch_template(
@@ -322,12 +328,6 @@ async def run_template_and_wait(
     final = await poll_job_to_completion(client, job_id, job_kind)
     status = str(final.get("status") or "unknown")
     lines.append(f"Final status: {status}.")
-    if job_kind == "job" and status in _TERMINAL:
-        stdout = await _job_stdout(client, job_id)
-        if stdout.strip():
-            lines.append("")
-            lines.append("Output:")
-            lines.append(stdout.strip())
     return "\n".join(lines)
 
 

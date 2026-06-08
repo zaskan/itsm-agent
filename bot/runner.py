@@ -19,23 +19,23 @@ from bot.aap_mcp import aap_mcp_configured, extract_template_from_kb, run_templa
 from bot.chat import chat_login, chat_me, reply_ws, subscribe_payload, ws_url
 from bot.config import HTTP_CLIENT_LIMITS, _env, _optional_env, mcp_url
 from bot.health import run_health_server, set_ready
-from bot.knowledge import mcp_rag_search, query_from_channel_body
+from bot.knowledge import is_incident_channel_message, mcp_rag_search, parse_incident_from_body, query_from_channel_body
 from bot.llm import LlmDecision, llm_assess
 from bot.itsm_mcp import (
-    catalog_workflow_applies,
     ensure_itsm_refs_for_launch,
     extract_catalog_from_kb,
     filter_missing_for_catalog,
     find_request_template,
     required_template_field_keys,
+    resolve_workflow_kind,
     specs_from_collected,
     template_field_keys,
 )
-from bot.sessions import ThreadSession, append_reply, get, put, remove
+from bot.sessions import ThreadSession, WorkflowKind, append_reply, get, put, remove
 
 log = logging.getLogger("itsm-agent-bot")
 
-_GO_RE = re.compile(r"(?i)\b(yes|yeah|yep|sure|ok|okay|please|launch|go\s+ahead|go|do\s+it)\b")
+_GO_RE = re.compile(r"(?i)\b(yes|yeah|yep|sure|ok|okay|please|launch|go\s+ahead|go|do\s+it|remediate|fix\s+it)\b")
 
 _seen_ws_message_ids: deque[tuple[str, float]] = deque(maxlen=256)
 _recent_message_fingerprints: deque[tuple[str, str, str, float]] = deque(maxlen=64)
@@ -84,6 +84,51 @@ def _merge_collected(session: ThreadSession, body: str) -> None:
                 session.collected[k] = v
     if not session.collected or len(text.splitlines()) == 1 and ":" not in text:
         session.collected["user_input"] = text
+    _seed_incident_fields(session)
+
+
+def _seed_incident_fields(session: ThreadSession) -> None:
+    if session.workflow_kind != "incident":
+        return
+    for key, val in parse_incident_from_body(session.user_query).items():
+        session.collected.setdefault(key, val)
+
+
+def _incident_fields_ready(session: ThreadSession) -> bool:
+    return bool(session.collected.get("itsm_incident_ref") and session.collected.get("vm_name"))
+
+
+def _session_workflow_kind(session: ThreadSession) -> WorkflowKind:
+    return session.workflow_kind or resolve_workflow_kind(session.kb_rows, session.user_query)
+
+
+def _apply_session_workflow(
+    session: ThreadSession,
+    *,
+    user_query: str,
+    kb_rows: list[dict[str, Any]],
+    catalog_name: str | None,
+) -> None:
+    session.workflow_kind = resolve_workflow_kind(kb_rows, user_query)
+    session.catalog_template_name = catalog_name if session.workflow_kind == "catalog" else None
+    _seed_incident_fields(session)
+
+
+def _incident_confirmation_reply(user_query: str, template_name: str | None) -> str:
+    parsed = parse_incident_from_body(user_query)
+    inc = parsed.get("itsm_incident_ref") or "the incident"
+    host = parsed.get("vm_name") or "the affected host"
+    tmpl = template_name or "remediation"
+    return (
+        f"Incident {inc} indicates the Apache application is down on {host}. "
+        f"Reply yes or remediate when you want me to launch {tmpl}."
+    )
+
+
+def _launch_prompt(workflow_kind: WorkflowKind, template_name: str) -> str:
+    if workflow_kind == "incident":
+        return f"Reply yes or remediate when you want me to launch {template_name}."
+    return f"Reply go when you want me to launch {template_name}."
 
 
 def _effective_template(decision: LlmDecision, kb_rows: list[dict[str, Any]], fallback: str | None) -> str | None:
@@ -106,6 +151,21 @@ async def _catalog_specs_ready(
     return not [k for k in required_template_field_keys(template) if k not in specs]
 
 
+async def _launch_fields_ready(
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
+) -> bool:
+    kind = _session_workflow_kind(session)
+    if kind == "catalog":
+        return await _catalog_specs_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token)
+    if kind == "incident":
+        return _incident_fields_ready(session)
+    return session.phase == "ready"
+
+
 async def _try_launch_from_session(
     ws: Any,
     http: httpx.AsyncClient,
@@ -117,10 +177,8 @@ async def _try_launch_from_session(
     template_name = session.template_candidate
     if not template_name:
         return False
-    if session.catalog_template_name:
-        if not await _catalog_specs_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token):
-            return False
-    elif session.phase != "ready":
+    _seed_incident_fields(session)
+    if not await _launch_fields_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token):
         return False
     return await _maybe_launch(
         ws, http, session, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
@@ -153,7 +211,10 @@ async def _launch_in_background(
             or "Cannot launch automation without itsm_change_ref" in itsm_msg
         ):
             result = itsm_msg
-        elif catalog_workflow_applies(session.kb_rows) and not session.collected.get("itsm_change_ref"):
+        elif (
+            _session_workflow_kind(session) == "catalog"
+            and not session.collected.get("itsm_change_ref")
+        ):
             result = (
                 "Cannot launch automation: itsm_change_ref is missing after the ITSM service request step."
             )
@@ -193,7 +254,7 @@ async def _maybe_launch(
         return True
     status = (
         "Opening ITSM service request and launching automation"
-        if catalog_workflow_applies(session.kb_rows)
+        if _session_workflow_kind(session) == "catalog"
         else f"Launching {template_name}"
     )
     session.phase = "running"
@@ -221,7 +282,8 @@ async def _apply_decision(
     mcp_token: str | None,
 ) -> None:
     template_name = _effective_template(decision, kb_rows, template_hint)
-    catalog_name = extract_catalog_from_kb(kb_rows) if catalog_workflow_applies(kb_rows) else None
+    workflow_kind = resolve_workflow_kind(kb_rows, user_query)
+    catalog_name = extract_catalog_from_kb(kb_rows) if workflow_kind == "catalog" else None
     missing_fields = filter_missing_for_catalog(decision.missing_fields) if catalog_name else decision.missing_fields
 
     if decision.action == "silent":
@@ -237,14 +299,15 @@ async def _apply_decision(
             template_candidate=template_name,
             missing_fields=[],
             catalog_template_name=catalog_name,
+            workflow_kind=workflow_kind,
             phase="ready",
         )
         sess.template_candidate = template_name
-        sess.catalog_template_name = catalog_name
         sess.phase = "ready"
+        _apply_session_workflow(sess, user_query=user_query, kb_rows=kb_rows, catalog_name=catalog_name)
         put(sess)
-        if template_name and await _maybe_launch(
-            ws, http, sess, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        if template_name and await _try_launch_from_session(
+            ws, http, sess, mcp_url_str=mcp_url_str, mcp_token=mcp_token
         ):
             return
         await reply_ws(ws, decision.reply or "Ready to proceed.", parent_id=root_id)
@@ -262,12 +325,13 @@ async def _apply_decision(
             template_candidate=template_name,
             missing_fields=missing_fields,
             catalog_template_name=catalog_name,
+            workflow_kind=workflow_kind,
             phase="collect",
         )
         sess.missing_fields = missing_fields
         sess.template_candidate = template_name
-        sess.catalog_template_name = catalog_name
         sess.phase = "collect"
+        _apply_session_workflow(sess, user_query=user_query, kb_rows=kb_rows, catalog_name=catalog_name)
         put(sess)
         await reply_ws(ws, reply, parent_id=root_id)
         return
@@ -275,7 +339,7 @@ async def _apply_decision(
     # action == answer
     reply = decision.reply
     if template_name and aap_mcp_configured():
-        sess = ThreadSession(
+        sess = session or ThreadSession(
             root_id=root_id,
             channel_id=ch_id,
             user_query=user_query,
@@ -283,13 +347,17 @@ async def _apply_decision(
             template_candidate=template_name,
             missing_fields=[],
             catalog_template_name=catalog_name,
+            workflow_kind=workflow_kind,
             phase="ready",
         )
+        sess.template_candidate = template_name
+        _apply_session_workflow(sess, user_query=user_query, kb_rows=kb_rows, catalog_name=catalog_name)
         put(sess)
+        prompt = _launch_prompt(workflow_kind, template_name)
         if reply:
-            reply = f"{reply.rstrip()}\n\nReply go when you want me to launch {template_name}."
+            reply = f"{reply.rstrip()}\n\n{prompt}"
         else:
-            reply = f"Reply go when you want me to launch {template_name}."
+            reply = prompt
     if reply:
         await reply_ws(ws, reply, parent_id=root_id)
 
@@ -320,7 +388,23 @@ async def _handle_root_message(
     decision = await llm_assess(http, llm_base, llm_model, llm_key, query, rows, template_hint=template_hint)
     if decision is None:
         log.warning("LLM assess returned nothing root=%s", root_id[:12])
-        return
+        if is_incident_channel_message(query):
+            decision = LlmDecision(
+                action="answer",
+                reply=_incident_confirmation_reply(query, template_hint),
+                missing_fields=[],
+                template_name=template_hint,
+            )
+        else:
+            return
+    elif decision.action == "silent" and is_incident_channel_message(query):
+        log.info("LLM silent on incident root=%s; using deterministic reply", root_id[:12])
+        decision = LlmDecision(
+            action="answer",
+            reply=_incident_confirmation_reply(query, template_hint or decision.template_name),
+            missing_fields=[],
+            template_name=decision.template_name or template_hint,
+        )
 
     await _apply_decision(
         ws,
@@ -440,22 +524,26 @@ async def run_bot() -> None:
                 if ev.get("type") != "message_created":
                     continue
                 payload = ev.get("payload") or {}
-                if str(payload.get("user_id", "")) == my_id_str:
-                    continue
                 body = payload.get("body")
                 if not isinstance(body, str) or not body.strip():
                     continue
+                author = str(payload.get("user_id", ""))
+                parent_id = payload.get("parent_id")
+                if author == my_id_str:
+                    if parent_id is not None:
+                        continue
+                    if not is_incident_channel_message(body):
+                        continue
+                    log.info("Processing incident notification posted as bot user")
                 ch_id = str(
                     payload.get("channel_id") or ev0.get("channel_id") or _optional_env("CHANNEL_ID") or ""
                 )
-                author = str(payload.get("user_id", ""))
                 mid = payload.get("id") if payload.get("id") is not None else payload.get("message_id")
                 if _consume_if_duplicate_event_id(mid):
                     continue
                 if _consume_if_duplicate_human_message(ch_id, author, body):
                     continue
 
-                parent_id = payload.get("parent_id")
                 if parent_id is not None:
                     root_id = str(parent_id)
                     session = get(root_id)

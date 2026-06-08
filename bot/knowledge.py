@@ -30,6 +30,48 @@ def kb_rows_from_tool_payload(data: Any) -> tuple[bool, list[dict[str, Any]]]:
     return False, []
 
 
+_INCIDENT_CREATED_RE = re.compile(r"(?i)\[incident\.created\]|incident\.created")
+_INCIDENT_REF_RE = re.compile(r"\b(INC-[\w-]+)\b", re.I)
+
+
+def is_incident_channel_message(body: str) -> bool:
+    s = body.strip()
+    if not s:
+        return False
+    if _INCIDENT_CREATED_RE.search(s):
+        return True
+    if _INCIDENT_REF_RE.search(s) and re.search(
+        r"(?i)\b(apache|application down|httpd|incident|remediat|probe failed)\b", s
+    ):
+        return True
+    return False
+
+
+def parse_incident_from_body(body: str) -> dict[str, str]:
+    """Extract itsm_incident_ref and vm_name from incident-shaped chat lines."""
+    out: dict[str, str] = {}
+    s = body.strip()
+    if not s:
+        return out
+    if m := _INCIDENT_REF_RE.search(s):
+        out["itsm_incident_ref"] = m.group(1).upper()
+    segments = [part.strip() for part in re.split(r"\s[—–-]\s", s) if part.strip()]
+    if len(segments) >= 2:
+        host_part = re.sub(r"\s*\([^)]+\)\s*$", "", segments[-1]).strip()
+        if host_part and not _INCIDENT_REF_RE.fullmatch(host_part):
+            out["vm_name"] = host_part
+    for line in s.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        k, v = key.strip().lower(), val.strip()
+        if k == "vm_name" and v:
+            out["vm_name"] = v
+        elif k in ("itsm_incident_ref", "incident_ref") and v:
+            out["itsm_incident_ref"] = v.upper()
+    return out
+
+
 def query_from_channel_body(body: str) -> str:
     """Use full message text as the RAG query (incident-shaped bodies still parse cleanly)."""
     s = body.strip()

@@ -5,15 +5,18 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 from bot.mcp import mcp_call_tool, mcp_headers_itsm
 
+from bot.knowledge import is_incident_channel_message
+
 log = logging.getLogger("itsm-agent-bot")
 
 _ITSM_REF_FIELDS = frozenset({"itsm_change_ref", "itsm_service_request_ref"})
+WorkflowKind = Literal["incident", "catalog", "generic"]
 
 
 def itsm_mcp_url(itsm_base: str) -> str:
@@ -77,23 +80,52 @@ def required_template_field_keys(template: dict[str, Any]) -> list[str]:
     return keys
 
 
-def extract_catalog_from_kb(kb_rows: list[dict[str, Any]]) -> str | None:
-    blob = "\n".join(
-        chunk
-        for row in kb_rows[:6]
-        for key in ("title", "description")
-        if (chunk := str(row.get(key, "") or "").strip())
-    )
-    m = re.search(r"(?is)ITSM catalog \*\*([^*]+)\*\*", blob)
-    if m and (name := m.group(1).strip()):
-        return name
-    if re.search(r"(?is)Apache Application Stack", blob):
-        return "Apache Application Stack"
+def extract_catalog_from_kb(kb_rows: list[dict[str, Any]], *, primary_only: bool = True) -> str | None:
+    rows = kb_rows[:1] if primary_only else kb_rows[:3]
+    for row in rows:
+        blob = "\n".join(
+            chunk
+            for key in ("title", "description")
+            if (chunk := str(row.get(key, "") or "").strip())
+        )
+        for pat in (
+            r"(?is)ITSM catalog \*\*([^*]+)\*\*",
+            r"(?is)Open catalog \*\*([^*]+)\*\*",
+            r"(?is)service catalog \*\*([^*]+)\*\*",
+        ):
+            if m := re.search(pat, blob):
+                if name := m.group(1).strip():
+                    return name
     return None
 
 
-def catalog_workflow_applies(kb_rows: list[dict[str, Any]]) -> bool:
-    return extract_catalog_from_kb(kb_rows) is not None
+def is_incident_kb_row(row: dict[str, Any]) -> bool:
+    blob = "\n".join(
+        str(row.get(key, "") or "")
+        for key in ("title", "description")
+    )
+    if re.search(r"(?i)\[incident\.created\]|itsm_incident_ref", blob):
+        return True
+    title = str(row.get("title") or "").lower()
+    return "incident" in title and "deploy" not in title and "service request" not in title
+
+
+def incident_workflow_applies(kb_rows: list[dict[str, Any]], user_query: str) -> bool:
+    if is_incident_channel_message(user_query):
+        return True
+    return bool(kb_rows) and is_incident_kb_row(kb_rows[0])
+
+
+def resolve_workflow_kind(kb_rows: list[dict[str, Any]], user_query: str) -> WorkflowKind:
+    if incident_workflow_applies(kb_rows, user_query):
+        return "incident"
+    if extract_catalog_from_kb(kb_rows, primary_only=True):
+        return "catalog"
+    return "generic"
+
+
+def catalog_workflow_applies(kb_rows: list[dict[str, Any]], user_query: str = "") -> bool:
+    return resolve_workflow_kind(kb_rows, user_query) == "catalog"
 
 
 def filter_missing_for_catalog(missing: list[str]) -> list[str]:
@@ -221,6 +253,8 @@ async def ensure_itsm_refs_for_launch(
         return collected, None
     catalog_name = extract_catalog_from_kb(kb_rows)
     if not catalog_name:
+        return collected, None
+    if incident_workflow_applies(kb_rows, user_query):
         return collected, None
 
     template = await find_request_template(client, mcp_url_str, mcp_token, catalog_name)

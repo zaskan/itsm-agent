@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Phase = Literal["collect", "ready", "running"]
+WorkflowKind = Literal["incident", "catalog", "generic"]
 
 _sessions: dict[str, "ThreadSession"] = {}
 
@@ -19,6 +20,7 @@ class ThreadSession:
     template_candidate: str | None
     missing_fields: list[str]
     catalog_template_name: str | None = None
+    workflow_kind: WorkflowKind = "generic"
     collected: dict[str, str] = field(default_factory=dict)
     thread_replies: list[str] = field(default_factory=list)
     phase: Phase = "collect"
