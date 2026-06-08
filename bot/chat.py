@@ -1,9 +1,8 @@
-"""demo-chat REST, WebSocket payloads, and launch-confirmation mention detection."""
+"""demo-chat REST, WebSocket payloads, and thread replies."""
 
 from __future__ import annotations
 
 import json
-import re
 import urllib.parse
 from typing import Any
 
@@ -34,12 +33,15 @@ def subscribe_payload() -> dict[str, Any]:
     return {"type": "subscribe", **channel_ref()}
 
 
-def send_payload(body: str) -> dict[str, Any]:
-    return {"type": "send_message", **channel_ref(), "body": body}
+def send_payload(body: str, parent_id: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"type": "send_message", **channel_ref(), "body": body}
+    if parent_id:
+        payload["parent_id"] = parent_id
+    return payload
 
 
-async def reply_ws(ws: Any, text: str) -> None:
-    await ws.send(json.dumps(send_payload(text)))
+async def reply_ws(ws: Any, text: str, parent_id: str | None = None) -> None:
+    await ws.send(json.dumps(send_payload(text, parent_id=parent_id)))
 
 
 async def chat_login(client: httpx.AsyncClient, base: str, user: str, password: str) -> str:
@@ -64,18 +66,3 @@ async def chat_me(client: httpx.AsyncClient, base: str, token: str) -> dict[str,
     )
     r.raise_for_status()
     return r.json()
-
-
-def body_mentions_username(body: str, username: str) -> bool:
-    u = (username or "").strip()
-    return bool(u) and re.search(rf"(?i)@{re.escape(u)}\b", body) is not None
-
-
-def body_is_affirmative_launch(body: str) -> bool:
-    stripped = re.sub(r"(?i)@\w[\w.-]*\s*", " ", body).strip()
-    return bool(
-        re.search(
-            r"(?i)\b(yes|yeah|yep|sure|ok|okay|please|launch|go\s+ahead|do\s+it)\b",
-            stripped,
-        )
-    )

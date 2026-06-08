@@ -1,4 +1,4 @@
-"""WebSocket event loop and incident / launch phase handlers."""
+"""WebSocket event loop: RAG-grounded thread replies and AAP MCP execution."""
 
 from __future__ import annotations
 
@@ -6,85 +6,300 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
+import time
+from collections import deque
 from typing import Any
 
 import httpx
 import websockets
 
-from bot.aap import (
-    aap_build_appendix,
-    aap_probe_api,
-    aap_try_launch_from_offer,
-    extract_aap_candidates,
-    pending_launch_by_channel,
-)
-from bot.chat import (
-    body_is_affirmative_launch,
-    body_mentions_username,
-    chat_login,
-    chat_me,
-    reply_ws,
-    subscribe_payload,
-    ws_url,
-)
-from bot.config import (
-    HTTP_CLIENT_LIMITS,
-    NOTHING,
-    _env,
-    _optional_env,
-    aap_api_base,
-    aap_configured,
-    mcp_url,
-)
+from bot.aap_mcp import aap_mcp_configured, extract_template_from_kb, run_template_and_wait, with_aap_client
+from bot.chat import chat_login, chat_me, reply_ws, subscribe_payload, ws_url
+from bot.config import HTTP_CLIENT_LIMITS, _env, _optional_env, mcp_url
 from bot.health import run_health_server, set_ready
-from bot.knowledge import mcp_rag_then_search_kb, query_from_channel_body
-from bot.llm import kb_fallback_reply, llm_answer, reply_is_non_answer
+from bot.knowledge import mcp_rag_search, query_from_channel_body
+from bot.llm import LlmDecision, llm_assess
+from bot.itsm_mcp import (
+    catalog_workflow_applies,
+    ensure_itsm_refs_for_launch,
+    extract_catalog_from_kb,
+    filter_missing_for_catalog,
+    find_request_template,
+    required_template_field_keys,
+    specs_from_collected,
+    template_field_keys,
+)
+from bot.sessions import ThreadSession, append_reply, get, put, remove
 
 log = logging.getLogger("itsm-agent-bot")
 
+_GO_RE = re.compile(r"(?i)\b(yes|yeah|yep|sure|ok|okay|please|launch|go\s+ahead|go|do\s+it)\b")
 
-async def _handle_launch_mention(
-    ws: Any, http: httpx.AsyncClient, body: str, ch_id: str, bot_username: str
+_seen_ws_message_ids: deque[tuple[str, float]] = deque(maxlen=256)
+_recent_message_fingerprints: deque[tuple[str, str, str, float]] = deque(maxlen=64)
+_DEDUP_TTL_SEC = 12.0
+
+
+def _consume_if_duplicate_event_id(mid: Any) -> bool:
+    if mid is None:
+        return False
+    sid = str(mid).strip()
+    if not sid:
+        return False
+    now = time.monotonic()
+    while _seen_ws_message_ids and now - _seen_ws_message_ids[0][1] > 60.0:
+        _seen_ws_message_ids.popleft()
+    for seen, _ in _seen_ws_message_ids:
+        if seen == sid:
+            log.info("Skipping duplicate message_created id=%s", sid[:32])
+            return True
+    _seen_ws_message_ids.append((sid, now))
+    return False
+
+
+def _consume_if_duplicate_human_message(channel_id: str, author: str, body: str) -> bool:
+    now = time.monotonic()
+    key = (channel_id, author, body.strip())
+    while _recent_message_fingerprints and now - _recent_message_fingerprints[0][3] > _DEDUP_TTL_SEC:
+        _recent_message_fingerprints.popleft()
+    for cid, a, b, _ in _recent_message_fingerprints:
+        if (cid, a, b) == key:
+            log.info("Skipping duplicate chat message fingerprint chan=%s user_id=%s", channel_id, author[:12])
+            return True
+    _recent_message_fingerprints.append((*key, now))
+    return False
+
+
+def _merge_collected(session: ThreadSession, body: str) -> None:
+    text = body.strip()
+    if not text:
+        return
+    for line in text.splitlines():
+        if ":" in line:
+            key, val = line.split(":", 1)
+            k, v = key.strip(), val.strip()
+            if k and v:
+                session.collected[k] = v
+    if not session.collected or len(text.splitlines()) == 1 and ":" not in text:
+        session.collected["user_input"] = text
+
+
+def _effective_template(decision: LlmDecision, kb_rows: list[dict[str, Any]], fallback: str | None) -> str | None:
+    return decision.template_name or fallback or extract_template_from_kb(kb_rows)
+
+
+async def _catalog_specs_ready(
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
 ) -> bool:
-    """Phase: launch_confirmation — returns True if the message was consumed."""
-    if not body_mentions_username(body, bot_username):
+    if not session.catalog_template_name:
         return False
-    if ch_id in pending_launch_by_channel and not body_is_affirmative_launch(body):
-        await reply_ws(
-            ws,
-            "Reply with yes or launch if you want me to run the template I offered, "
-            "or send a new incident without @mention.",
-        )
-        return True
-    if not body_is_affirmative_launch(body):
+    template = await find_request_template(http, mcp_url_str, mcp_token, session.catalog_template_name)
+    if template is None:
         return False
-    if not aap_configured():
-        await reply_ws(ws, "AAP launch is not configured (missing API URL or token).")
-        return True
-    if ch_id not in pending_launch_by_channel:
-        await reply_ws(
-            ws,
-            "There is no job or workflow template waiting to launch. "
-            "Post an incident first so I can suggest one from the knowledge base.",
-        )
-        return True
-    offer = pending_launch_by_channel[ch_id]
+    specs = specs_from_collected(template, session.collected)
+    return not [k for k in required_template_field_keys(template) if k not in specs]
+
+
+async def _try_launch_from_session(
+    ws: Any,
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
+) -> bool:
+    template_name = session.template_candidate
+    if not template_name:
+        return False
+    if session.catalog_template_name:
+        if not await _catalog_specs_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token):
+            return False
+    elif session.phase != "ready":
+        return False
+    return await _maybe_launch(
+        ws, http, session, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+    )
+
+
+async def _launch_in_background(
+    ws: Any,
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    template_name: str,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
+) -> None:
+    session.phase = "running"
     try:
-        reply = await aap_try_launch_from_offer(ws, http, offer)
+        collected, itsm_msg = await ensure_itsm_refs_for_launch(
+            http,
+            mcp_url_str,
+            mcp_token,
+            kb_rows=session.kb_rows,
+            collected=session.collected,
+            user_query=session.user_query,
+        )
+        session.collected = collected
+        if itsm_msg and (
+            itsm_msg.startswith("Opening the ITSM service request failed")
+            or itsm_msg.startswith("I could not find the ITSM catalog template")
+            or "Cannot launch automation without itsm_change_ref" in itsm_msg
+        ):
+            result = itsm_msg
+        elif catalog_workflow_applies(session.kb_rows) and not session.collected.get("itsm_change_ref"):
+            result = (
+                "Cannot launch automation: itsm_change_ref is missing after the ITSM service request step."
+            )
+        else:
+            parts: list[str] = []
+            if itsm_msg:
+                parts.append(itsm_msg)
+            aap_result = await with_aap_client(
+                http, lambda c: run_template_and_wait(c, template_name, session.collected)
+            )
+            parts.append(aap_result)
+            result = "\n\n".join(parts)
     except Exception:
-        log.exception("AAP launch")
-        reply = "Launch failed due to an internal error."
-    await reply_ws(ws, reply)
+        log.exception("Launch pipeline failed root=%s", session.root_id[:12])
+        result = "Automation run failed due to an internal error."
+    await reply_ws(ws, result, parent_id=session.root_id)
+    remove(session.root_id)
+
+
+async def _maybe_launch(
+    ws: Any,
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    template_name: str,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
+) -> bool:
+    if not template_name:
+        return False
+    if not aap_mcp_configured():
+        await reply_ws(
+            ws,
+            "Automation is not configured (missing AAP_MCP_BASE_URL or AAP_MCP_TOKEN).",
+            parent_id=session.root_id,
+        )
+        return True
+    status = (
+        "Opening ITSM service request and launching automation"
+        if catalog_workflow_applies(session.kb_rows)
+        else f"Launching {template_name}"
+    )
+    session.phase = "running"
+    await reply_ws(ws, f"{status}…", parent_id=session.root_id)
+    asyncio.create_task(
+        _launch_in_background(
+            ws, http, session, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        )
+    )
     return True
 
 
-async def _handle_incident_message(
+async def _apply_decision(
+    ws: Any,
+    http: httpx.AsyncClient,
+    *,
+    root_id: str,
+    ch_id: str,
+    user_query: str,
+    kb_rows: list[dict[str, Any]],
+    decision: LlmDecision,
+    session: ThreadSession | None,
+    template_hint: str | None,
+    mcp_url_str: str,
+    mcp_token: str | None,
+) -> None:
+    template_name = _effective_template(decision, kb_rows, template_hint)
+    catalog_name = extract_catalog_from_kb(kb_rows) if catalog_workflow_applies(kb_rows) else None
+    missing_fields = filter_missing_for_catalog(decision.missing_fields) if catalog_name else decision.missing_fields
+
+    if decision.action == "silent":
+        log.info("LLM silent for root=%s", root_id[:12])
+        return
+
+    if decision.action == "launch_ready":
+        sess = session or ThreadSession(
+            root_id=root_id,
+            channel_id=ch_id,
+            user_query=user_query,
+            kb_rows=kb_rows,
+            template_candidate=template_name,
+            missing_fields=[],
+            catalog_template_name=catalog_name,
+            phase="ready",
+        )
+        sess.template_candidate = template_name
+        sess.catalog_template_name = catalog_name
+        sess.phase = "ready"
+        put(sess)
+        if template_name and await _maybe_launch(
+            ws, http, sess, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        ):
+            return
+        await reply_ws(ws, decision.reply or "Ready to proceed.", parent_id=root_id)
+        return
+
+    if decision.action == "need_info":
+        reply = decision.reply
+        if catalog_name:
+            reply = f"{reply.rstrip()} I will open the ITSM catalog request {catalog_name} for you once the deployment details are provided."
+        sess = session or ThreadSession(
+            root_id=root_id,
+            channel_id=ch_id,
+            user_query=user_query,
+            kb_rows=kb_rows,
+            template_candidate=template_name,
+            missing_fields=missing_fields,
+            catalog_template_name=catalog_name,
+            phase="collect",
+        )
+        sess.missing_fields = missing_fields
+        sess.template_candidate = template_name
+        sess.catalog_template_name = catalog_name
+        sess.phase = "collect"
+        put(sess)
+        await reply_ws(ws, reply, parent_id=root_id)
+        return
+
+    # action == answer
+    reply = decision.reply
+    if template_name and aap_mcp_configured():
+        sess = ThreadSession(
+            root_id=root_id,
+            channel_id=ch_id,
+            user_query=user_query,
+            kb_rows=kb_rows,
+            template_candidate=template_name,
+            missing_fields=[],
+            catalog_template_name=catalog_name,
+            phase="ready",
+        )
+        put(sess)
+        if reply:
+            reply = f"{reply.rstrip()}\n\nReply go when you want me to launch {template_name}."
+        else:
+            reply = f"Reply go when you want me to launch {template_name}."
+    if reply:
+        await reply_ws(ws, reply, parent_id=root_id)
+
+
+async def _handle_root_message(
     ws: Any,
     http: httpx.AsyncClient,
     body: str,
     ch_id: str,
-    author: str,
+    root_id: str,
     *,
     mcp_url_str: str,
     mcp_token: str | None,
@@ -93,41 +308,93 @@ async def _handle_incident_message(
     llm_model: str,
     llm_key: str | None,
 ) -> None:
-    """Phase: incident_rag_llm — RAG, LLM summary, optional AAP appendix, then reply."""
     query = query_from_channel_body(body)
-    log.info(
-        "Handling user_id=%s RAG query (len=%s): %s",
-        author,
-        len(query),
-        query[:200].replace("\n", " | "),
+    log.info("Root message root=%s query=%s", root_id[:12], query[:120].replace("\n", " | "))
+
+    ok, rows = await mcp_rag_search(http, mcp_url_str, mcp_token, query, top_k)
+    if not ok:
+        log.info("No RAG hits root=%s", root_id[:12])
+        return
+
+    template_hint = extract_template_from_kb(rows)
+    decision = await llm_assess(http, llm_base, llm_model, llm_key, query, rows, template_hint=template_hint)
+    if decision is None:
+        log.warning("LLM assess returned nothing root=%s", root_id[:12])
+        return
+
+    await _apply_decision(
+        ws,
+        http,
+        root_id=root_id,
+        ch_id=ch_id,
+        user_query=query,
+        kb_rows=rows,
+        decision=decision,
+        session=None,
+        template_hint=template_hint,
+        mcp_url_str=mcp_url_str,
+        mcp_token=mcp_token,
     )
-    try:
-        ok, rows = await mcp_rag_then_search_kb(http, mcp_url_str, mcp_token, query, top_k)
-        if not ok:
-            log.warning("No KB rows from rag_search_kb or search_kb; sample=%s", query[:80])
-            reply = NOTHING
-        else:
-            log.info("KB rows=%s first_title=%r", len(rows), rows[0].get("title", "")[:60])
-            reply = await llm_answer(http, llm_base, llm_model, llm_key, query, rows)
-            if reply_is_non_answer(reply):
-                log.info("LLM returned empty/negative; using KB excerpt fallback")
-                reply = kb_fallback_reply(rows)
-            if aap_configured() and (cands := extract_aap_candidates(rows)):
-                try:
-                    apx, launch_offer = await aap_build_appendix(http, cands, ch_id)
-                    if apx:
-                        reply = f"{reply.rstrip()}\n\n{apx}"
-                    if launch_offer and ch_id:
-                        pending_launch_by_channel[ch_id] = launch_offer
-                        reply = f"{reply.rstrip()}\n\nDo you want me to launch the job for you?"
-                    elif launch_offer:
-                        log.warning("AAP launch offer skipped: could not resolve channel_id from event")
-                except Exception:
-                    log.exception("AAP lookup appendix failed")
-    except Exception:
-        log.exception("RAG/LLM failed")
-        reply = NOTHING
-    await reply_ws(ws, reply)
+
+
+async def _handle_thread_followup(
+    ws: Any,
+    http: httpx.AsyncClient,
+    body: str,
+    session: ThreadSession,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
+    llm_base: str,
+    llm_model: str,
+    llm_key: str | None,
+) -> None:
+    if session.phase == "running":
+        return
+
+    append_reply(session, body)
+    _merge_collected(session, body)
+
+    if _GO_RE.search(body.strip()):
+        if await _try_launch_from_session(
+            ws, http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        ):
+            return
+
+    decision = await llm_assess(
+        http,
+        llm_base,
+        llm_model,
+        llm_key,
+        session.user_query,
+        session.kb_rows,
+        thread_replies=session.thread_replies,
+        collected=session.collected,
+        template_hint=session.template_candidate,
+    )
+    if decision is None:
+        log.warning("LLM assess failed on thread root=%s", session.root_id[:12])
+        return
+
+    if decision.action == "launch_ready" and session.template_candidate:
+        if await _try_launch_from_session(
+            ws, http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        ):
+            return
+
+    await _apply_decision(
+        ws,
+        http,
+        root_id=session.root_id,
+        ch_id=session.channel_id,
+        user_query=session.user_query,
+        kb_rows=session.kb_rows,
+        decision=decision,
+        session=session,
+        template_hint=session.template_candidate,
+        mcp_url_str=mcp_url_str,
+        mcp_token=mcp_token,
+    )
 
 
 async def run_bot() -> None:
@@ -148,9 +415,9 @@ async def run_bot() -> None:
         my_id_str = str(me["id"])
         log.info("Logged in as %s id=%s", me.get("username"), my_id_str)
 
-        if aap_configured():
-            log.info("AAP REST → %s", aap_api_base())
-            await aap_probe_api(http)
+        if aap_mcp_configured():
+            log.info("AAP MCP → %s", _optional_env("AAP_MCP_BASE_URL"))
+        log.info("ITSM MCP → %s", mcp_url_str)
 
         async with websockets.connect(ws_url(chat_base, token), max_size=10 * 1024 * 1024) as ws:
             await ws.send(json.dumps(subscribe_payload()))
@@ -163,7 +430,6 @@ async def run_bot() -> None:
             set_ready()
             log.info("Subscribed to channel channel_id=%s", ev0.get("channel_id"))
 
-            bot_username = str(me.get("username") or "")
             async for message in ws:
                 if isinstance(message, bytes):
                     message = message.decode()
@@ -182,15 +448,44 @@ async def run_bot() -> None:
                 ch_id = str(
                     payload.get("channel_id") or ev0.get("channel_id") or _optional_env("CHANNEL_ID") or ""
                 )
-
-                if await _handle_launch_mention(ws, http, body, ch_id, bot_username):
+                author = str(payload.get("user_id", ""))
+                mid = payload.get("id") if payload.get("id") is not None else payload.get("message_id")
+                if _consume_if_duplicate_event_id(mid):
                     continue
-                await _handle_incident_message(
+                if _consume_if_duplicate_human_message(ch_id, author, body):
+                    continue
+
+                parent_id = payload.get("parent_id")
+                if parent_id is not None:
+                    root_id = str(parent_id)
+                    session = get(root_id)
+                    if session is None:
+                        log.debug("Ignoring thread reply without session root=%s", root_id[:12])
+                        continue
+                    await _handle_thread_followup(
+                        ws,
+                        http,
+                        body,
+                        session,
+                        mcp_url_str=mcp_url_str,
+                        mcp_token=mcp_token,
+                        llm_base=llm_base,
+                        llm_model=llm_model,
+                        llm_key=llm_key,
+                    )
+                    continue
+
+                root_id = str(mid) if mid is not None else ""
+                if not root_id:
+                    log.warning("Root message missing id; cannot thread reply")
+                    continue
+
+                await _handle_root_message(
                     ws,
                     http,
                     body,
                     ch_id,
-                    str(payload.get("user_id", "")),
+                    root_id,
                     mcp_url_str=mcp_url_str,
                     mcp_token=mcp_token,
                     top_k=top_k,

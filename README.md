@@ -1,17 +1,26 @@
 # ITSM Agent Bot
 
-A channel bot for **demo-chat** that turns incident-style messages into knowledge-base answers and, optionally, Ansible Automation Platform (AAP) job template suggestions and launches.
+A channel bot for **demo-chat** that answers from the **itsm-app** knowledge base (RAG) and runs Ansible Automation Platform jobs via **AAP MCP** when the user completes a thread conversation.
 
-The bot connects over WebSocket to a single chat channel, runs semantic search against **itsm-app** via MCP, summarizes hits with an OpenAI-compatible LLM (LiteLLM), and can resolve matching AAP job or workflow job templates via **Controller REST API v2** (template names come from KB text; no AAP MCP calls). When a template is found, it asks for confirmation; the user can launch it with a one-line `@<bot_username> yes` reply.
+The bot connects over WebSocket to a single chat channel, searches KB articles with MCP `rag_search_kb`, summarizes hits with LiteLLM, replies **in the message thread**, and launches matching controller templates through MCP after the user supplies any required inputs.
 
 ## How it works
 
 1. **Subscribe** — Logs into demo-chat, joins the channel from `CHANNEL_NAME` or `CHANNEL_ID`, and listens for `message_created` events (ignores its own messages).
-2. **Incident parsing** — Plain-text bodies with `Title:` / `Description:` lines are condensed into a RAG query; CamelCase tokens are split for fallback keyword search.
-3. **Retrieval** — Calls itsm-app MCP `rag_search_kb`. If nothing matches, it may try MCP `search_kb` on title keywords.
-4. **Summary** — Sends retrieved chunks to LiteLLM (`/v1/chat/completions`) for a short reply.
-5. **AAP appendix (optional)** — For each template name inferred from KB text, looks up templates with a few Controller REST `GET` calls (`workflow_job_templates`, `job_templates`). Appends an **AAP** section and, when a template matches, asks: *Do you want me to launch the job for you?*
-6. **Launch on confirm** — If the user mentions `@<bot_username>` with an affirmative reply (`yes`, `launch`, `go ahead`, etc.), the bot launches the offered template, acknowledges with the job id, polls until completion, and posts a follow-up with status and a UI link.
+2. **Root message** — Any new top-level user message triggers RAG search. If nothing relevant is found, the bot stays **silent**.
+3. **Thread reply** — When RAG hits apply, the bot posts its answer as a **thread reply** (`parent_id` = the user's message id).
+4. **Collect info** — If the KB procedure needs extra values, the bot asks for them in the same thread and keeps session state in memory.
+5. **Launch via MCP** — When inputs are complete (or the user replies `go` / `yes`), the bot opens an ITSM catalog service request when the KB requires it (`create_request` → `add_ritm` → `submit_request`), then resolves and launches the AAP workflow template, polls to completion, and posts stdout/status in the thread.
+
+```mermaid
+flowchart TD
+  rootMsg[Root message] --> rag[rag_search_kb]
+  rag -->|no hits| silent[No reply]
+  rag -->|hits| llm[LLM JSON assess]
+  llm --> threadReply[Thread reply]
+  threadMsg[Thread follow-up] --> aapMcp[AAP MCP launch + poll]
+  aapMcp --> result[Result in thread]
+```
 
 Health endpoints on port `8080` (default):
 
@@ -23,9 +32,9 @@ Health endpoints on port `8080` (default):
 ## Prerequisites
 
 - **demo-chat** — REST + WebSocket API; a bot user and target channel.
-- **itsm-app** — MCP at `{ITSM_BASE_URL}/mcp/` with `rag_search_kb` (and optionally `search_kb`).
-- **LiteLLM** (or any OpenAI-compatible API) — For summarizing KB hits.
-- **AAP Controller API** (optional) — REST at `AAP_CONTROLLER_API_URL` (e.g. `https://ansible-aap…/api/v2`). OAuth2 Bearer token with read templates, launch, and read jobs. No aap-mcp-server required for this bot.
+- **itsm-app** — MCP at `{ITSM_BASE_URL}/mcp/` with `rag_search_kb`.
+- **LiteLLM** (or any OpenAI-compatible API) — For structured KB assessment.
+- **AAP MCP** (optional) — HTTP MCP gateway with controller tools (`AAP_MCP_BASE_URL`, `AAP_MCP_TOKEN`).
 
 ## Configuration
 
@@ -51,13 +60,11 @@ Copy [`k8s/secret_template.yaml`](k8s/secret_template.yaml) to `k8s/secret.yaml`
 | `RAG_TOP_K` | Max KB hits (default `5`) |
 | `HEALTH_PORT` | Health server port (default `8080`) |
 | `LOG_LEVEL` | Logging level (default `INFO`) |
-| `AAP_CONTROLLER_API_URL` | Full Controller REST API base (**no auto-suffix** for AAP 2.6+: e.g. `https://…/api/controller/v2`). Only a bare `https://host` adds legacy `/api/v2`. |
-| `AAP_API_TOKEN` | Bearer token for AAP REST (falls back to `AAP_MCP_TOKEN` if unset) |
-| `AAP_CONTROLLER_UI_URL` | Controller UI origin for job links when API omits `html_url` |
+| `AAP_MCP_BASE_URL` | AAP MCP gateway origin (MCP at `{base}/mcp/`) |
+| `AAP_MCP_TOKEN` | Bearer token for AAP MCP |
+| `AAP_CONTROLLER_UI_URL` | Controller UI origin for job links |
 | `AAP_JOB_POLL_INTERVAL_SEC` / `AAP_JOB_POLL_TIMEOUT_SEC` | Poll tuning (defaults `5` / `3600`) |
-| `AAP_TLS_VERIFY` | Set `false` to skip TLS verify for AAP REST only (lab/self-signed) |
-
-See the module docstring in [`bot/__init__.py`](bot/__init__.py) and README for env vars and launch-tool defaults.
+| `AAP_TLS_VERIFY` | Set `false` to skip TLS verify for AAP MCP (lab/self-signed) |
 
 ## Local run
 
@@ -74,73 +81,38 @@ export ITSM_BASE_URL=...
 export LLM_BASE_URL=...
 export LLM_MODEL=...
 export LLM_API_KEY=...
-# optional AAP_* ...
+# optional AAP_MCP_* ...
 
 PYTHONPATH=src:. python -m itsm_agent.main
-# or: PYTHONPATH=src:. python -m bot.runner
 ```
 
 ## Deploy on OpenShift
 
-The manifests assume namespace **`itsm-agent`** and an image built into that namespace’s ImageStream.
-
-### 1. Namespace and secrets
-
 ```bash
 oc apply -f k8s/namespace.yaml
-cp k8s/secret_template.yaml k8s/secret.yaml
-# Edit k8s/secret.yaml — replace placeholders; do not commit secret.yaml
-oc apply -f k8s/secret.yaml
-```
-
-### 2. Build and push image
-
-From the repo root (where `Dockerfile` lives):
-
-```bash
+oc apply -f k8s/secret.yaml   # after filling values
 oc project itsm-agent
-oc new-build --name=itsm-agent --binary --strategy=docker -n itsm-agent \
-  || true
+oc new-build --name=itsm-agent --binary --strategy=docker -n itsm-agent || true
 oc start-build itsm-agent --from-dir=. --follow -n itsm-agent
-```
-
-Adjust `image:` in [`k8s/deployment.yaml`](k8s/deployment.yaml) if your internal registry path differs from:
-
-`image-registry.openshift-image-registry.svc:5000/itsm-agent/itsm-agent:latest`
-
-### 3. Deploy
-
-```bash
 oc apply -f k8s/deployment.yaml
 oc rollout status deployment/itsm-agent -n itsm-agent
-oc logs -f deployment/itsm-agent -n itsm-agent
 ```
-
-After a code change, run `oc start-build` again; the deployment uses `imagePullPolicy: Always` so nodes pull the new `:latest` digest.
-
-### 4. Verify
-
-- Readiness: `oc exec deploy/itsm-agent -n itsm-agent -- wget -qO- http://127.0.0.1:8080/readyz`
-- Post a test incident in the channel (with `Title:` / `Description:`).
-- If AAP is configured and a template matches, confirm with `@<your_bot_username> yes` and check for launch ack + completion message.
 
 ## Project layout
 
 | Path | Purpose |
 |------|---------|
-| [`bot/`](bot/) | Bot package: `runner` (WS loop), `knowledge` (RAG), `llm`, `aap`, `mcp`, `chat`, `config` |
-| [`src/itsm_agent/main.py`](src/itsm_agent/main.py) | Container entrypoint (`python -m itsm_agent.main`) |
-| [`Dockerfile`](Dockerfile) | Python 3.12 image |
-| [`k8s/`](k8s/) | Namespace, Deployment, secret template |
+| [`bot/runner.py`](bot/runner.py) | WebSocket loop, root/thread handlers |
+| [`bot/knowledge.py`](bot/knowledge.py) | RAG via MCP |
+| [`bot/llm.py`](bot/llm.py) | Structured LLM assessment |
+| [`bot/aap_mcp.py`](bot/aap_mcp.py) | Template resolve, launch, poll via AAP MCP |
+| [`bot/sessions.py`](bot/sessions.py) | In-memory thread session state |
+| [`bot/chat.py`](bot/chat.py) | demo-chat login and thread replies |
+| [`src/itsm_agent/main.py`](src/itsm_agent/main.py) | Container entrypoint |
 
-## AAP launch notes
+## Notes
 
-- Set `AAP_CONTROLLER_API_URL` to the Controller **API** (`/api/v2`), not the browser UI or MCP gateway.
-- Token needs permission to list/launch job and workflow job templates and read job status.
-- Typical incident: **2–4** REST `GET`s for template lookup (not dozens of MCP handshakes).
-- Pending launch offers are kept **in memory** per channel. Pod restarts clear pending state.
-- Only one monitor task per channel; a second `@bot yes` while a job is monitored is rejected with a short message.
-
-## License
-
-See repository defaults; add a `LICENSE` file if your organization requires one.
+- Thread sessions are **in-memory**; pod restarts clear pending conversations.
+- The bot does **not** reply when RAG finds nothing or the LLM marks excerpts as not applicable.
+- If itsm-app RAG is not configured (`rag_not_configured`), the bot falls back to MCP `search_kb` for keyword matches only.
+- KB articles should name AAP templates explicitly (e.g. `Job template "[JT] …"`) for launch to work.
