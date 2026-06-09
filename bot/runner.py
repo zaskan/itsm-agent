@@ -19,7 +19,13 @@ from bot.aap_mcp import aap_mcp_configured, extract_template_from_kb, run_templa
 from bot.chat import chat_login, chat_me, reply_ws, subscribe_payload, ws_url
 from bot.config import HTTP_CLIENT_LIMITS, _env, _optional_env, mcp_url
 from bot.health import run_health_server, set_ready
-from bot.knowledge import is_incident_channel_message, mcp_rag_search, parse_incident_from_body, query_from_channel_body
+from bot.knowledge import (
+    is_incident_channel_message,
+    is_remediation_complete_message,
+    mcp_rag_search,
+    parse_incident_from_body,
+    query_from_channel_body,
+)
 from bot.llm import LlmDecision, llm_assess
 from bot.itsm_mcp import (
     ensure_itsm_refs_for_launch,
@@ -31,7 +37,16 @@ from bot.itsm_mcp import (
     specs_from_collected,
     template_field_keys,
 )
-from bot.sessions import ThreadSession, WorkflowKind, append_reply, get, put, remove
+from bot.sessions import (
+    ThreadSession,
+    WorkflowKind,
+    append_reply,
+    get,
+    incident_root_for,
+    put,
+    remember_incident_root,
+    remove,
+)
 
 log = logging.getLogger("itsm-agent-bot")
 
@@ -102,6 +117,14 @@ def _session_workflow_kind(session: ThreadSession) -> WorkflowKind:
     return session.workflow_kind or resolve_workflow_kind(session.kb_rows, session.user_query)
 
 
+def _remember_incident_thread_root(session: ThreadSession) -> None:
+    if session.workflow_kind != "incident":
+        return
+    _seed_incident_fields(session)
+    if ref := session.collected.get("itsm_incident_ref"):
+        remember_incident_root(ref, session.root_id)
+
+
 def _apply_session_workflow(
     session: ThreadSession,
     *,
@@ -111,7 +134,22 @@ def _apply_session_workflow(
 ) -> None:
     session.workflow_kind = resolve_workflow_kind(kb_rows, user_query)
     session.catalog_template_name = catalog_name if session.workflow_kind == "catalog" else None
-    _seed_incident_fields(session)
+    _remember_incident_thread_root(session)
+
+
+async def _forward_remediation_to_thread(ws: Any, body: str) -> bool:
+    parsed = parse_incident_from_body(body)
+    inc = parsed.get("itsm_incident_ref")
+    if not inc:
+        log.warning("remediation.complete missing incident ref")
+        return False
+    thread_root = incident_root_for(inc)
+    if not thread_root:
+        log.warning("No thread root mapped for remediation %s", inc)
+        return False
+    await reply_ws(ws, body.strip(), parent_id=thread_root)
+    log.info("Forwarded remediation.complete for %s to thread root=%s", inc, thread_root[:12])
+    return True
 
 
 def _incident_confirmation_reply(user_query: str, template_name: str | None) -> str:
@@ -379,6 +417,11 @@ async def _handle_root_message(
     query = query_from_channel_body(body)
     log.info("Root message root=%s query=%s", root_id[:12], query[:120].replace("\n", " | "))
 
+    if is_incident_channel_message(query):
+        parsed = parse_incident_from_body(query)
+        if ref := parsed.get("itsm_incident_ref"):
+            remember_incident_root(ref, root_id)
+
     ok, rows = await mcp_rag_search(http, mcp_url_str, mcp_token, query, top_k)
     if not ok:
         log.info("No RAG hits root=%s", root_id[:12])
@@ -532,6 +575,9 @@ async def run_bot() -> None:
                 if author == my_id_str:
                     if parent_id is not None:
                         continue
+                    if is_remediation_complete_message(body):
+                        await _forward_remediation_to_thread(ws, body)
+                        continue
                     if not is_incident_channel_message(body):
                         continue
                     log.info("Processing incident notification posted as bot user")
@@ -542,6 +588,12 @@ async def run_bot() -> None:
                 if _consume_if_duplicate_event_id(mid):
                     continue
                 if _consume_if_duplicate_human_message(ch_id, author, body):
+                    continue
+
+                if parent_id is None and is_remediation_complete_message(body):
+                    if await _forward_remediation_to_thread(ws, body):
+                        continue
+                    log.warning("remediation.complete at channel root with no mapped thread")
                     continue
 
                 if parent_id is not None:

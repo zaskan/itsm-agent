@@ -9,6 +9,17 @@ Phase = Literal["collect", "ready", "running"]
 WorkflowKind = Literal["incident", "catalog", "generic"]
 
 _sessions: dict[str, "ThreadSession"] = {}
+_incident_roots: dict[str, str] = {}
+
+
+def remember_incident_root(incident_ref: str, root_id: str) -> None:
+    ref = incident_ref.strip().upper()
+    if ref and root_id:
+        _incident_roots[ref] = root_id
+
+
+def incident_root_for(incident_ref: str) -> str | None:
+    return _incident_roots.get(incident_ref.strip().upper())
 
 
 @dataclass

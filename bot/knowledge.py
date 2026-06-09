@@ -31,12 +31,19 @@ def kb_rows_from_tool_payload(data: Any) -> tuple[bool, list[dict[str, Any]]]:
 
 
 _INCIDENT_CREATED_RE = re.compile(r"(?i)\[incident\.created\]|incident\.created")
+_REMEDIATION_COMPLETE_RE = re.compile(r"(?i)\[remediation\.complete\]|remediation\.complete")
 _INCIDENT_REF_RE = re.compile(r"\b(INC-[\w-]+)\b", re.I)
+
+
+def is_remediation_complete_message(body: str) -> bool:
+    return bool(_REMEDIATION_COMPLETE_RE.search(body.strip()))
 
 
 def is_incident_channel_message(body: str) -> bool:
     s = body.strip()
     if not s:
+        return False
+    if is_remediation_complete_message(s):
         return False
     if _INCIDENT_CREATED_RE.search(s):
         return True
