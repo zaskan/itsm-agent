@@ -23,7 +23,9 @@ from bot.knowledge import (
     is_incident_channel_message,
     is_remediation_complete_message,
     mcp_rag_search,
+    parse_catalog_field_from_thread,
     parse_incident_from_body,
+    parse_vm_name_from_query,
     query_from_channel_body,
 )
 from bot.llm import LlmDecision, llm_assess
@@ -87,19 +89,38 @@ def _consume_if_duplicate_human_message(channel_id: str, author: str, body: str)
     return False
 
 
+def _seed_catalog_context(session: ThreadSession) -> None:
+    if _session_workflow_kind(session) != "catalog":
+        return
+    if not session.collected.get("vm_name"):
+        if vm := parse_vm_name_from_query(session.user_query):
+            session.collected["vm_name"] = vm
+
+
 def _merge_collected(session: ThreadSession, body: str) -> None:
     text = body.strip()
     if not text:
         return
+    parsed_any = False
     for line in text.splitlines():
         if ":" in line:
             key, val = line.split(":", 1)
             k, v = key.strip(), val.strip()
             if k and v:
                 session.collected[k] = v
-    if not session.collected or len(text.splitlines()) == 1 and ":" not in text:
-        session.collected["user_input"] = text
+                parsed_any = True
+    if _session_workflow_kind(session) == "catalog":
+        targets = session.missing_fields or ["vm_name", "cpus", "mem", "app_repo"]
+        for field in targets:
+            if str(session.collected.get(field, "")).strip():
+                continue
+            if val := parse_catalog_field_from_thread(text, field):
+                session.collected[field] = val
+                parsed_any = True
+    _seed_catalog_context(session)
     _seed_incident_fields(session)
+    if not parsed_any and len(text.splitlines()) == 1 and ":" not in text:
+        session.collected["user_input"] = text
 
 
 def _seed_incident_fields(session: ThreadSession) -> None:
@@ -134,6 +155,7 @@ def _apply_session_workflow(
 ) -> None:
     session.workflow_kind = resolve_workflow_kind(kb_rows, user_query)
     session.catalog_template_name = catalog_name if session.workflow_kind == "catalog" else None
+    _seed_catalog_context(session)
     _remember_incident_thread_root(session)
 
 
@@ -185,8 +207,29 @@ async def _catalog_specs_ready(
     template = await find_request_template(http, mcp_url_str, mcp_token, session.catalog_template_name)
     if template is None:
         return False
+    _seed_catalog_context(session)
     specs = specs_from_collected(template, session.collected)
     return not [k for k in required_template_field_keys(template) if k not in specs]
+
+
+async def _refresh_catalog_missing_fields(
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    *,
+    mcp_url_str: str,
+    mcp_token: str | None,
+) -> None:
+    if _session_workflow_kind(session) != "catalog" or not session.catalog_template_name:
+        return
+    template = await find_request_template(http, mcp_url_str, mcp_token, session.catalog_template_name)
+    if template is None:
+        return
+    _seed_catalog_context(session)
+    session.missing_fields = [
+        k
+        for k in required_template_field_keys(template)
+        if not str(session.collected.get(k, "")).strip()
+    ]
 
 
 async def _launch_fields_ready(
@@ -344,8 +387,8 @@ async def _apply_decision(
         sess.phase = "ready"
         _apply_session_workflow(sess, user_query=user_query, kb_rows=kb_rows, catalog_name=catalog_name)
         put(sess)
-        if template_name and await _try_launch_from_session(
-            ws, http, sess, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        if template_name and await _maybe_launch(
+            ws, http, sess, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
         ):
             return
         await reply_ws(ws, decision.reply or "Ready to proceed.", parent_id=root_id)
@@ -481,6 +524,16 @@ async def _handle_thread_followup(
 
     append_reply(session, body)
     _merge_collected(session, body)
+    await _refresh_catalog_missing_fields(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token)
+
+    template_name = session.template_candidate or extract_template_from_kb(session.kb_rows)
+    if template_name and await _launch_fields_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token):
+        session.template_candidate = template_name
+        put(session)
+        if await _maybe_launch(
+            ws, http, session, template_name, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+        ):
+            return
 
     if _GO_RE.search(body.strip()):
         if await _try_launch_from_session(
@@ -503,9 +556,17 @@ async def _handle_thread_followup(
         log.warning("LLM assess failed on thread root=%s", session.root_id[:12])
         return
 
-    if decision.action == "launch_ready" and session.template_candidate:
-        if await _try_launch_from_session(
-            ws, http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token
+    template_name = session.template_candidate or extract_template_from_kb(session.kb_rows)
+    if decision.action == "launch_ready" and template_name:
+        session.template_candidate = template_name
+        put(session)
+        if await _maybe_launch(
+            ws,
+            http,
+            session,
+            template_name,
+            mcp_url_str=mcp_url_str,
+            mcp_token=mcp_token,
         ):
             return
 

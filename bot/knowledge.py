@@ -54,6 +54,62 @@ def is_incident_channel_message(body: str) -> bool:
     return False
 
 
+def parse_vm_name_from_query(query: str) -> str | None:
+    q = query.strip()
+    if not q:
+        return None
+    stop = frozenset({"cpu", "cpus", "mem", "memory", "extra", "add", "increase", "modify", "change"})
+    for pat in (
+        r"(?i)\bvm_name\s*:\s*(\S+)",
+        r"(?i)\bin\s+([a-z][a-z0-9_-]+)\s*$",
+        r"(?i)\bto\s+([a-z][a-z0-9]*\d[a-z0-9_-]*)\b",
+        r"(?i)\b(?:for|on)\s+([a-z][a-z0-9_-]+)\b",
+        r"(?i)\b([a-z][a-z0-9]*\d[a-z0-9_-]*)\b",
+    ):
+        if m := re.search(pat, q):
+            host = m.group(1).strip().rstrip(".,;")
+            if host.lower() not in stop and len(host) >= 2:
+                return host
+    return None
+
+
+def parse_catalog_field_from_thread(body: str, field: str) -> str | None:
+    text = body.strip()
+    if not text:
+        return None
+    if field == "cpus":
+        for pat in (
+            r"(?i)\bcpus?\s*:\s*(\d+)",
+            r"(?i)\b(\d+)\s*(?:extra\s+)?cpus?\b",
+            r"(?i)^(\d+)$",
+        ):
+            if m := re.search(pat, text):
+                return m.group(1)
+    if field == "mem":
+        for pat in (
+            r"(?i)\bmem(?:ory)?\s*:\s*(\d+)",
+            r"(?i)\b(\d+)\s*(?:extra\s+)?(?:gib|gb|gi)\b",
+            r"(?i)\b(\d+)\s*(?:gib|gb|gi)\b",
+            r"(?i)^(\d+)$",
+        ):
+            if m := re.search(pat, text):
+                return m.group(1)
+    if field == "vm_name":
+        for pat in (
+            r"(?i)\bvm_name\s*:\s*(\S+)",
+            r"(?i)\b(?:for|on|to)\s+([a-z][a-z0-9_-]+)\b",
+            r"(?i)^([a-z][a-z0-9_-]+)$",
+        ):
+            if m := re.search(pat, text):
+                host = m.group(1).strip().rstrip(".,;")
+                if len(host) >= 2:
+                    return host
+    if field == "app_repo":
+        if m := re.search(r"(?i)\bapp_repo\s*:\s*(\S+)", text):
+            return m.group(1).strip()
+    return None
+
+
 def parse_incident_from_body(body: str) -> dict[str, str]:
     """Extract itsm_incident_ref and vm_name from incident-shaped chat lines."""
     out: dict[str, str] = {}
