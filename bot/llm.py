@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 import httpx
 
-from bot.config import litellm_chat_completions_url
+from bot.config import lightspeed_playbook_max_tokens, litellm_chat_completions_url
 
 log = logging.getLogger("itsm-agent-bot")
 
@@ -31,6 +31,8 @@ _SYSTEM = (
     "- When excerpts describe incident remediation ([incident.created], itsm_incident_ref, INC-*), "
     "do NOT mention ITSM catalog service requests or deployment fields (cpus, mem, app_repo). "
     "Ask for confirmation or any missing vm_name / itsm_incident_ref only.\n"
+    "- When excerpts describe a different problem than the incident (e.g. Apache down vs memory exhaustion), "
+    "use action silent — do not suggest unrelated automation or templates.\n"
     "- When excerpts say to open an ITSM catalog service request, do NOT ask for itsm_change_ref or itsm_service_request_ref; "
     "the bot creates those via ITSM MCP. Only list deployment/catalog field keys still missing (e.g. vm_name, cpus, mem, app_repo).\n"
     "- If Collected values already contain every required catalog field, use action launch_ready — do not ask again for values already "
@@ -45,6 +47,26 @@ _KB_EXCERPTS_IRRELEVANT = re.compile(
     r"excerpts\s+clearly\s+do\s+not\s+apply|nothing\s+in\s+the\s+(?:provided\s+)?(?:knowledge\s+base\s+)?excerpts|"
     r"cannot\s+(?:find|determine).*from\s+the\s+excerpts|not\s+supported\s+by\s+the\s+excerpts)"
 )
+
+_KB_INCIDENT_MISMATCH = re.compile(
+    r"(?is)"
+    r"(?:available automation is for|automation is (?:only )?for|"
+    r"excerpts?(?:\s+do)?\s+not\s+(?:apply|match|cover|address)|"
+    r"does\s+not\s+(?:contain|cover|address)|"
+    r"do\s+not\s+(?:contain|cover|address)|"
+    r"no\s+(?:relevant|matching|applicable)\s+(?:documentation|article|excerpt)|"
+    r"not\s+(?:related|relevant)\s+to\s+(?:this|the)\s+incident|"
+    r"knowledge base does not)"
+)
+
+
+def kb_decision_inapplicable(decision: LlmDecision) -> bool:
+    """True when the LLM indicates KB excerpts do not fit the user's incident."""
+    if decision.action == "silent":
+        return True
+    if _KB_EXCERPTS_IRRELEVANT.search(decision.reply):
+        return True
+    return bool(_KB_INCIDENT_MISMATCH.search(decision.reply))
 
 
 @dataclass
@@ -185,4 +207,65 @@ async def llm_assess(
         return decision_from_payload(obj)
     except Exception:
         log.exception("LLM assess failed")
+        return None
+
+
+def _strip_markdown_fences(text: str) -> str:
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"(?is)^```(?:yaml|yml|ansible)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+def _assistant_content(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    for key in ("reasoning_content", "reasoning"):
+        alt = message.get(key)
+        if isinstance(alt, str) and alt.strip():
+            return alt.strip()
+    return None
+
+
+async def llm_generate_playbook(
+    client: httpx.AsyncClient,
+    llm_base: str,
+    model: str,
+    api_key: str | None,
+    incident_text: str,
+) -> str | None:
+    """Ask Lightspeed for Ansible remediation tasks only (no KB excerpts)."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    prompt = f"{incident_text.strip()}. Suggest a fix. Provide ONLY the ansible code"
+    try:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.6,
+            "max_tokens": lightspeed_playbook_max_tokens(),
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
+        r = await client.post(
+            litellm_chat_completions_url(llm_base),
+            json=payload,
+            headers=headers,
+            timeout=120.0,
+        )
+        r.raise_for_status()
+        choices = r.json().get("choices")
+        if not isinstance(choices, list) or not choices:
+            log.warning("Lightspeed playbook response missing choices")
+            return None
+        content = _assistant_content(choices[0].get("message") or {})
+        if not content:
+            log.warning("Lightspeed playbook response missing content")
+            return None
+        playbook = _strip_markdown_fences(content)
+        return playbook if playbook else None
+    except Exception:
+        log.exception("Lightspeed playbook generation failed")
         return None

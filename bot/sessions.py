@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Phase = Literal["collect", "ready", "running"]
-WorkflowKind = Literal["incident", "catalog", "generic"]
+WorkflowKind = Literal["incident", "catalog", "generic", "lightspeed"]
 
 _sessions: dict[str, "ThreadSession"] = {}
 _incident_roots: dict[str, str] = {}

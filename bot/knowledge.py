@@ -39,6 +39,54 @@ def is_remediation_complete_message(body: str) -> bool:
     return bool(_REMEDIATION_COMPLETE_RE.search(body.strip()))
 
 
+_TOPIC_STOP = frozenset(
+    {
+        "incident",
+        "created",
+        "the",
+        "and",
+        "for",
+        "with",
+        "this",
+        "that",
+        "from",
+        "have",
+        "application",
+        "service",
+        "alert",
+        "probe",
+        "failed",
+        "down",
+        "remediat",
+        "troubleshoot",
+    }
+)
+
+
+def _significant_topic_words(text: str) -> set[str]:
+    return {
+        w
+        for w in re.findall(r"[a-z][a-z0-9_-]+", text.lower())
+        if len(w) >= 4 and w not in _TOPIC_STOP
+    }
+
+
+def incident_kb_topic_mismatch(query: str, kb_rows: list[dict[str, Any]]) -> bool:
+    """True when the top KB article topic does not overlap the incident description."""
+    if not kb_rows:
+        return True
+    incident_words = _significant_topic_words(query)
+    if not incident_words:
+        return False
+    kb_blob = "\n".join(
+        str(kb_rows[0].get(key, "") or "") for key in ("title", "description")
+    )
+    kb_words = _significant_topic_words(kb_blob)
+    if not kb_words:
+        return False
+    return not (incident_words & kb_words)
+
+
 def is_incident_channel_message(body: str) -> bool:
     s = body.strip()
     if not s:

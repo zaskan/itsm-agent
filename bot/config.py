@@ -69,3 +69,13 @@ def mcp_url(itsm_base: str) -> str:
 def litellm_chat_completions_url(llm_base: str) -> str:
     b = llm_base.rstrip("/")
     return f"{b}/chat/completions" if b.endswith("/v1") else f"{b}/v1/chat/completions"
+
+
+def lightspeed_remediation_template() -> str:
+    return os.environ.get("LIGHTSPEED_REMEDIATION_TEMPLATE", "Lightspeed Remediation").strip() or (
+        "Lightspeed Remediation"
+    )
+
+
+def lightspeed_playbook_max_tokens() -> int:
+    return max(256, int(os.environ.get("LIGHTSPEED_PLAYBOOK_MAX_TOKENS", "1500")))

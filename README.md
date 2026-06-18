@@ -7,7 +7,7 @@ The bot connects over WebSocket to a single chat channel, searches KB articles w
 ## How it works
 
 1. **Subscribe** — Logs into demo-chat, joins the channel from `CHANNEL_NAME` or `CHANNEL_ID`, and listens for `message_created` events (ignores its own messages).
-2. **Root message** — Any new top-level user message triggers RAG search. If nothing relevant is found, the bot stays **silent**.
+2. **Root message** — Any new top-level user message triggers RAG search. If nothing relevant is found, the bot stays **silent** (except incident-shaped messages — see Lightspeed fallback below).
 3. **Thread reply** — When RAG hits apply, the bot posts its answer as a **thread reply** (`parent_id` = the user's message id).
 4. **Collect info** — If the KB procedure needs extra values, the bot asks for them in the same thread and keeps session state in memory.
 5. **Launch via MCP** — When inputs are complete (or the user replies `go` / `yes`), the bot opens an ITSM catalog service request when the KB requires it (`create_request` → `add_ritm` → `submit_request`), then resolves and launches the AAP workflow template, polls to completion, and posts stdout/status in the thread.
@@ -65,6 +65,8 @@ Copy [`k8s/secret_template.yaml`](k8s/secret_template.yaml) to `k8s/secret.yaml`
 | `AAP_CONTROLLER_UI_URL` | Controller UI origin for job links |
 | `AAP_JOB_POLL_INTERVAL_SEC` / `AAP_JOB_POLL_TIMEOUT_SEC` | Poll tuning (defaults `5` / `3600`) |
 | `AAP_TLS_VERIFY` | Set `false` to skip TLS verify for AAP MCP (lab/self-signed) |
+| `LIGHTSPEED_REMEDIATION_TEMPLATE` | AAP workflow template for generated playbooks (default `Lightspeed Remediation`) |
+| `LIGHTSPEED_PLAYBOOK_MAX_TOKENS` | LLM token budget for playbook generation (default `1500`) |
 
 ## Local run
 
@@ -113,6 +115,7 @@ oc rollout status deployment/itsm-agent -n itsm-agent
 ## Notes
 
 - Thread sessions are **in-memory**; pod restarts clear pending conversations.
-- The bot does **not** reply when RAG finds nothing or the LLM marks excerpts as not applicable.
+- The bot does **not** reply when RAG finds nothing or the LLM marks excerpts as not applicable — **except** for incident-shaped messages with no KB hits (Lightspeed fallback).
+- **Lightspeed fallback** — When an incident notification matches (`INC-*`, `[incident.created]`, etc.) but RAG returns no articles, the bot asks LiteLLM to generate an Ansible playbook, proposes it in the thread, and on confirmation launches the `Lightspeed Remediation` workflow with `ansible_playbook` and `itsm_incident_ref` as extra vars and the affected host as the job limit. Gitea upload is performed by that workflow, not the bot.
 - If itsm-app RAG is not configured (`rag_not_configured`), the bot falls back to MCP `search_kb` for keyword matches only.
 - KB articles should name AAP templates explicitly (e.g. `Job template "[JT] …"`) for launch to work.

@@ -22,6 +22,7 @@ from bot.config import (
     aap_mcp_token,
     aap_mcp_url,
     aap_tls_verify_enabled,
+    lightspeed_remediation_template,
 )
 from bot.mcp import mcp_call_tool, mcp_headers_aap
 
@@ -221,11 +222,15 @@ async def launch_template(
     client: httpx.AsyncClient,
     resolved: ResolvedTemplate,
     collected: dict[str, str],
+    *,
+    limit: str | None = None,
 ) -> dict[str, Any]:
     extra = _extra_vars(collected)
     request_body: dict[str, Any] = {}
     if extra:
         request_body["extra_vars"] = extra
+    if limit:
+        request_body["limit"] = limit.strip()
     if resolved.kind == "workflow":
         tool = "workflow_job_templates_launch_create"
     else:
@@ -310,6 +315,60 @@ async def run_template_and_wait(
         launch_payload = await launch_template(client, resolved, collected)
     except Exception as e:
         log.exception("AAP MCP launch failed")
+        return f"Launch failed: {e}"
+
+    launched = _launched_job(launch_payload)
+    if not launched:
+        return f"Launch returned an unexpected response: {str(launch_payload)[:400]}"
+
+    job_rec, job_kind = launched
+    job_id = int(job_rec["id"])
+    kind_label = "workflow job" if job_kind == "workflow" else "job"
+    lines = [
+        f"Launched {kind_label} template {resolved.template_name} (run id {job_id}).",
+    ]
+    if url := _job_output_url(job_rec, job_kind):
+        lines.append(f"Controller: {url}")
+
+    final = await poll_job_to_completion(client, job_id, job_kind)
+    status = str(final.get("status") or "unknown")
+    lines.append(f"Final status: {status}.")
+    return "\n".join(lines)
+
+
+def _lightspeed_launch_collected(collected: dict[str, str]) -> dict[str, str]:
+    return {
+        k: str(collected[k])
+        for k in ("ansible_playbook", "itsm_incident_ref")
+        if str(collected.get(k, "")).strip()
+    }
+
+
+async def run_lightspeed_remediation(
+    client: httpx.AsyncClient,
+    collected: dict[str, str],
+) -> str:
+    if not aap_mcp_configured():
+        return "AAP MCP is not configured (missing AAP_MCP_BASE_URL or AAP_MCP_TOKEN)."
+
+    template_name = lightspeed_remediation_template()
+    limit = str(collected.get("vm_name", "")).strip()
+    launch_vars = _lightspeed_launch_collected(collected)
+    if not launch_vars.get("ansible_playbook"):
+        return "Cannot launch Lightspeed remediation: ansible_playbook is missing."
+    if not launch_vars.get("itsm_incident_ref"):
+        return "Cannot launch Lightspeed remediation: itsm_incident_ref is missing."
+    if not limit:
+        return "Cannot launch Lightspeed remediation: vm_name (host limit) is missing."
+
+    resolved = await resolve_template(client, template_name)
+    if resolved is None:
+        return f"I could not find an Ansible template matching {template_name!r} in the controller."
+
+    try:
+        launch_payload = await launch_template(client, resolved, launch_vars, limit=limit)
+    except Exception as e:
+        log.exception("Lightspeed remediation launch failed")
         return f"Launch failed: {e}"
 
     launched = _launched_job(launch_payload)
