@@ -244,7 +244,19 @@ async def llm_generate_playbook(
     try:
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You write minimal, safe Ansible playbooks for Linux VM remediation. "
+                        "Return ONLY valid YAML. Prefer dedicated ansible.builtin modules "
+                        "(service, package, file, systemd, yum, dnf, apt, etc.) over "
+                        "ansible.builtin.command or ansible.builtin.shell; use command/shell "
+                        "only when no suitable module exists."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
             "temperature": 0.6,
             "max_tokens": lightspeed_playbook_max_tokens(),
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},

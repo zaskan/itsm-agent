@@ -170,7 +170,10 @@ def parse_incident_from_body(body: str) -> dict[str, str]:
     if len(segments) >= 2:
         host_part = re.sub(r"\s*\([^)]+\)\s*$", "", segments[-1]).strip()
         if host_part and not _INCIDENT_REF_RE.fullmatch(host_part):
-            out["vm_name"] = host_part
+            if vm := parse_vm_name_from_query(host_part):
+                out["vm_name"] = vm
+            elif re.fullmatch(r"[a-z][a-z0-9_-]+", host_part, re.I):
+                out["vm_name"] = host_part
     for line in s.splitlines():
         if ":" not in line:
             continue
