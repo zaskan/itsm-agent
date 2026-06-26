@@ -16,6 +16,7 @@ import httpx
 import websockets
 
 from bot.aap_mcp import aap_mcp_configured, extract_template_from_kb, run_template_and_wait, with_aap_client
+from bot.apache_assets import enrich_collected_from_apache_asset
 from bot.chat import chat_login, chat_me, reply_ws, subscribe_payload, ws_url
 from bot.config import HTTP_CLIENT_LIMITS, _env, _optional_env, mcp_url
 from bot.health import run_health_server, set_ready
@@ -284,6 +285,12 @@ async def _launch_in_background(
             kb_rows=session.kb_rows,
             collected=session.collected,
             user_query=session.user_query,
+        )
+        collected = await enrich_collected_from_apache_asset(
+            http,
+            mcp_url_str,
+            mcp_token,
+            dict(collected),
         )
         session.collected = collected
         if itsm_msg and (
