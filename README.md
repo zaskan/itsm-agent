@@ -66,6 +66,8 @@ Copy [`k8s/secret_template.yaml`](k8s/secret_template.yaml) to `k8s/secret.yaml`
 | `AAP_JOB_POLL_INTERVAL_SEC` / `AAP_JOB_POLL_TIMEOUT_SEC` | Poll tuning (defaults `5` / `3600`) |
 | `AAP_TLS_VERIFY` | Set `false` to skip TLS verify for AAP MCP (lab/self-signed) |
 
+On workflow launch, the bot can enrich AAP `extra_vars` from ITSM **Generic Application** assets: `rpm_packages` → `apache_app_rpm_packages`, `enabled_services` → `apache_app_enabled_services`, `app_clone_path` → `apache_app_docroot`, plus derived legacy vars (`apache_app_package`, `apache_app_git_package`, `apache_app_service`). See [`bot/apache_assets.py`](bot/apache_assets.py).
+
 ## Local run
 
 ```bash
@@ -106,6 +108,7 @@ oc rollout status deployment/itsm-agent -n itsm-agent
 | [`bot/knowledge.py`](bot/knowledge.py) | RAG via MCP |
 | [`bot/llm.py`](bot/llm.py) | Structured LLM assessment |
 | [`bot/aap_mcp.py`](bot/aap_mcp.py) | Template resolve, launch, poll via AAP MCP |
+| [`bot/apache_assets.py`](bot/apache_assets.py) | Map ITSM Generic Application assets to AAP extra_vars |
 | [`bot/sessions.py`](bot/sessions.py) | In-memory thread session state |
 | [`bot/chat.py`](bot/chat.py) | demo-chat login and thread replies |
 | [`src/itsm_agent/main.py`](src/itsm_agent/main.py) | Container entrypoint |
