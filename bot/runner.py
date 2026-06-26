@@ -324,8 +324,8 @@ async def _launch_in_background(
             launch_collected = dict(session.collected)
             if (
                 _session_workflow_kind(session) == "incident"
-                and launch_collected.get("itsm_incident_ref")
                 and session.template_candidate == lightspeed_workflow_name()
+                and not str(launch_collected.get("ansible_playbook") or "").strip()
             ):
                 launch_collected = await ensure_lightspeed_playbook_in_collected(
                     http,
@@ -594,15 +594,60 @@ async def _handle_root_message(
         else:
             return
     elif decision.action == "silent" and is_incident_channel_message(query):
-        log.info("LLM silent on incident root=%s; using deterministic reply", root_id[:12])
-        decision = LlmDecision(
-            action="answer",
-            reply=_incident_confirmation_reply(
-                query, template_hint or decision.template_name, kb_rows=rows
-            ),
-            missing_fields=[],
-            template_name=decision.template_name or template_hint,
-        )
+        if apache_troubleshoot_path_applies(rows, query):
+            log.info("LLM silent on incident root=%s; using deterministic reply", root_id[:12])
+            decision = LlmDecision(
+                action="answer",
+                reply=_incident_confirmation_reply(
+                    query, template_hint or decision.template_name, kb_rows=rows
+                ),
+                missing_fields=[],
+                template_name=decision.template_name or template_hint,
+            )
+        else:
+            parsed = parse_incident_from_body(query)
+            wf = lightspeed_workflow_name()
+            sess = ThreadSession(
+                root_id=root_id,
+                channel_id=ch_id,
+                user_query=query,
+                kb_rows=rows,
+                template_candidate=wf,
+                missing_fields=[],
+                catalog_template_name=None,
+                workflow_kind="incident",
+                phase="collect",
+            )
+            for key, val in parsed.items():
+                sess.collected[key] = val
+            if not sess.collected.get("itsm_incident_ref"):
+                sess.collected["itsm_incident_ref"] = f"CHAT-{root_id[:8].upper()}"
+            await _present_lightspeed_playbook(
+                ws, http, sess, root_id=root_id, workflow_name=wf
+            )
+            return
+    elif decision.action == "silent":
+        vm = parse_vm_name_from_query(query)
+        if vm:
+            log.info("LLM silent on remediation root=%s; drafting Lightspeed playbook", root_id[:12])
+            wf = lightspeed_workflow_name()
+            sess = ThreadSession(
+                root_id=root_id,
+                channel_id=ch_id,
+                user_query=query,
+                kb_rows=rows,
+                template_candidate=wf,
+                missing_fields=[],
+                catalog_template_name=None,
+                workflow_kind="incident",
+                phase="collect",
+            )
+            sess.collected["vm_name"] = vm
+            sess.collected.setdefault("itsm_incident_ref", f"CHAT-{root_id[:8].upper()}")
+            await _present_lightspeed_playbook(
+                ws, http, sess, root_id=root_id, workflow_name=wf
+            )
+            return
 
     await _apply_decision(
         ws,

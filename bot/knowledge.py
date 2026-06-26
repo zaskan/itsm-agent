@@ -61,10 +61,11 @@ def parse_vm_name_from_query(query: str) -> str | None:
     stop = frozenset({"cpu", "cpus", "mem", "memory", "extra", "add", "increase", "modify", "change"})
     for pat in (
         r"(?i)\bvm_name\s*:\s*(\S+)",
+        r"(?i)\bvm\s+server\s+([a-z][a-z0-9_-]+)\b",
+        r"(?i)\b([a-z][a-z0-9]*\d[a-z0-9_-]*)\b",
         r"(?i)\bin\s+([a-z][a-z0-9_-]+)\s*$",
         r"(?i)\bto\s+([a-z][a-z0-9]*\d[a-z0-9_-]*)\b",
         r"(?i)\b(?:for|on)\s+([a-z][a-z0-9_-]+)\b",
-        r"(?i)\b([a-z][a-z0-9]*\d[a-z0-9_-]*)\b",
     ):
         if m := re.search(pat, q):
             host = m.group(1).strip().rstrip(".,;")
