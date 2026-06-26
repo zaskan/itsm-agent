@@ -17,6 +17,18 @@ import websockets
 
 from bot.aap_mcp import aap_mcp_configured, extract_template_from_kb, run_template_and_wait, with_aap_client
 from bot.apache_assets import enrich_collected_from_apache_asset
+from bot.lightspeed_remediation import (
+    apache_troubleshoot_path_applies,
+    ensure_lightspeed_playbook_in_collected,
+    incident_confirmation_reply,
+    lightspeed_incident_reply,
+    lightspeed_launch_fields_ready,
+    lightspeed_playbook_generation_failed_reply,
+    lightspeed_playbook_review_reply,
+    lightspeed_workflow_name,
+    refresh_incident_session_template,
+    resolve_incident_template,
+)
 from bot.chat import chat_login, chat_me, reply_ws, subscribe_payload, ws_url
 from bot.config import HTTP_CLIENT_LIMITS, _env, _optional_env, mcp_url
 from bot.health import run_health_server, set_ready
@@ -175,15 +187,13 @@ async def _forward_remediation_to_thread(ws: Any, body: str) -> bool:
     return True
 
 
-def _incident_confirmation_reply(user_query: str, template_name: str | None) -> str:
-    parsed = parse_incident_from_body(user_query)
-    inc = parsed.get("itsm_incident_ref") or "the incident"
-    host = parsed.get("vm_name") or "the affected host"
-    tmpl = template_name or "remediation"
-    return (
-        f"Incident {inc} indicates the Apache application is down on {host}. "
-        f"Reply yes or remediate when you want me to launch {tmpl}."
-    )
+def _incident_confirmation_reply(
+    user_query: str,
+    template_name: str | None,
+    *,
+    kb_rows: list[dict[str, Any]] | None = None,
+) -> str:
+    return incident_confirmation_reply(user_query, kb_rows or [], template_name)
 
 
 def _launch_prompt(workflow_kind: WorkflowKind, template_name: str) -> str:
@@ -244,7 +254,11 @@ async def _launch_fields_ready(
     if kind == "catalog":
         return await _catalog_specs_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token)
     if kind == "incident":
-        return _incident_fields_ready(session)
+        if not _incident_fields_ready(session):
+            return False
+        if session.template_candidate == lightspeed_workflow_name():
+            return lightspeed_launch_fields_ready(session)
+        return True
     return session.phase == "ready"
 
 
@@ -307,11 +321,22 @@ async def _launch_in_background(
                 "Cannot launch automation: itsm_change_ref is missing after the ITSM service request step."
             )
         else:
+            launch_collected = dict(session.collected)
+            if (
+                _session_workflow_kind(session) == "incident"
+                and launch_collected.get("itsm_incident_ref")
+                and session.template_candidate == lightspeed_workflow_name()
+            ):
+                launch_collected = await ensure_lightspeed_playbook_in_collected(
+                    http,
+                    launch_collected,
+                    user_query=session.user_query,
+                )
             parts: list[str] = []
             if itsm_msg:
                 parts.append(itsm_msg)
             aap_result = await with_aap_client(
-                http, lambda c: run_template_and_wait(c, template_name, session.collected)
+                http, lambda c: run_template_and_wait(c, template_name, launch_collected)
             )
             parts.append(aap_result)
             result = "\n\n".join(parts)
@@ -371,6 +396,8 @@ async def _apply_decision(
 ) -> None:
     template_name = _effective_template(decision, kb_rows, template_hint)
     workflow_kind = resolve_workflow_kind(kb_rows, user_query)
+    if workflow_kind == "incident":
+        template_name = resolve_incident_template(kb_rows, user_query, template_name)
     catalog_name = extract_catalog_from_kb(kb_rows) if workflow_kind == "catalog" else None
     missing_fields = filter_missing_for_catalog(decision.missing_fields) if catalog_name else decision.missing_fields
 
@@ -450,6 +477,43 @@ async def _apply_decision(
         await reply_ws(ws, reply, parent_id=root_id)
 
 
+
+
+async def _present_lightspeed_playbook(
+    ws: Any,
+    http: httpx.AsyncClient,
+    session: ThreadSession,
+    *,
+    root_id: str,
+    workflow_name: str,
+) -> None:
+    try:
+        session.collected = await ensure_lightspeed_playbook_in_collected(
+            http,
+            session.collected,
+            user_query=session.user_query,
+        )
+    except Exception:
+        log.exception("Lightspeed playbook generation failed root=%s", root_id[:12])
+        await reply_ws(
+            ws,
+            lightspeed_playbook_generation_failed_reply(session.user_query),
+            parent_id=root_id,
+        )
+        return
+    session.phase = "ready"
+    _remember_incident_thread_root(session)
+    put(session)
+    await reply_ws(
+        ws,
+        lightspeed_playbook_review_reply(
+            session.collected["ansible_playbook"],
+            workflow_name=workflow_name,
+        ),
+        parent_id=root_id,
+    )
+
+
 async def _handle_root_message(
     ws: Any,
     http: httpx.AsyncClient,
@@ -475,16 +539,55 @@ async def _handle_root_message(
     ok, rows = await mcp_rag_search(http, mcp_url_str, mcp_token, query, top_k)
     if not ok:
         log.info("No RAG hits root=%s", root_id[:12])
+        if is_incident_channel_message(query):
+            parsed = parse_incident_from_body(query)
+            wf = lightspeed_workflow_name()
+            sess = ThreadSession(
+                root_id=root_id,
+                channel_id=ch_id,
+                user_query=query,
+                kb_rows=[],
+                template_candidate=wf,
+                missing_fields=[],
+                catalog_template_name=None,
+                workflow_kind="incident",
+                phase="collect",
+            )
+            for key, val in parsed.items():
+                sess.collected[key] = val
+            await _present_lightspeed_playbook(
+                ws, http, sess, root_id=root_id, workflow_name=wf
+            )
         return
 
     template_hint = extract_template_from_kb(rows)
+    if is_incident_channel_message(query) and not apache_troubleshoot_path_applies(rows, query):
+        wf = lightspeed_workflow_name()
+        parsed = parse_incident_from_body(query)
+        sess = ThreadSession(
+            root_id=root_id,
+            channel_id=ch_id,
+            user_query=query,
+            kb_rows=rows,
+            template_candidate=wf,
+            missing_fields=[],
+            catalog_template_name=None,
+            workflow_kind="incident",
+            phase="collect",
+        )
+        for key, val in parsed.items():
+            sess.collected[key] = val
+        await _present_lightspeed_playbook(
+            ws, http, sess, root_id=root_id, workflow_name=wf
+        )
+        return
     decision = await llm_assess(http, llm_base, llm_model, llm_key, query, rows, template_hint=template_hint)
     if decision is None:
         log.warning("LLM assess returned nothing root=%s", root_id[:12])
         if is_incident_channel_message(query):
             decision = LlmDecision(
                 action="answer",
-                reply=_incident_confirmation_reply(query, template_hint),
+                reply=_incident_confirmation_reply(query, template_hint, kb_rows=rows),
                 missing_fields=[],
                 template_name=template_hint,
             )
@@ -494,7 +597,9 @@ async def _handle_root_message(
         log.info("LLM silent on incident root=%s; using deterministic reply", root_id[:12])
         decision = LlmDecision(
             action="answer",
-            reply=_incident_confirmation_reply(query, template_hint or decision.template_name),
+            reply=_incident_confirmation_reply(
+                query, template_hint or decision.template_name, kb_rows=rows
+            ),
             missing_fields=[],
             template_name=decision.template_name or template_hint,
         )
@@ -533,8 +638,34 @@ async def _handle_thread_followup(
     _merge_collected(session, body)
     await _refresh_catalog_missing_fields(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token)
 
+    if _session_workflow_kind(session) == "incident":
+        refresh_incident_session_template(session)
+        put(session)
+
+    if (
+        _session_workflow_kind(session) == "incident"
+        and session.template_candidate == lightspeed_workflow_name()
+        and _GO_RE.search(body.strip())
+        and not lightspeed_launch_fields_ready(session)
+    ):
+        await _present_lightspeed_playbook(
+            ws,
+            http,
+            session,
+            root_id=session.root_id,
+            workflow_name=session.template_candidate or lightspeed_workflow_name(),
+        )
+        return
+
     template_name = session.template_candidate or extract_template_from_kb(session.kb_rows)
-    if template_name and await _launch_fields_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token):
+    if (
+        template_name
+        and await _launch_fields_ready(http, session, mcp_url_str=mcp_url_str, mcp_token=mcp_token)
+        and (
+            _session_workflow_kind(session) != "incident"
+            or _GO_RE.search(body.strip())
+        )
+    ):
         session.template_candidate = template_name
         put(session)
         if await _maybe_launch(
